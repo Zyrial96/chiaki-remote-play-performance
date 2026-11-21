@@ -1,0 +1,738 @@
+diff --git a/app/src/main/java/com/chiaking/tv/common/settings/Preferences.kt b/app/src/main/java/com/chiaking/tv/common/settings/Preferences.kt
+index 31c7d47..538b256 100644
+--- a/app/src/main/java/com/chiaking/tv/common/settings/Preferences.kt
++++ b/app/src/main/java/com/chiaking/tv/common/settings/Preferences.kt
+@@ -62,6 +62,10 @@ class Preferences(context: Context)
+ 		WIDEBAND(1103, "8 kHz")
+ 	}
+ 
++	var balancedFramePacing
++		get() = sharedPreferences.getBoolean("balanced_frame_pacing", false)
++		set(value) { sharedPreferences.edit().putBoolean("balanced_frame_pacing", value).apply() }
++
+ 	enum class DisplayMode(val value: String, val titleRes: Int)
+ 	{
+ 		FIT("fit", R.string.display_mode_fit),
+diff --git a/app/src/main/java/com/chiaking/tv/session/StreamInput.kt b/app/src/main/java/com/chiaking/tv/session/StreamInput.kt
+index 3a50f2e..3ef83b9 100644
+--- a/app/src/main/java/com/chiaking/tv/session/StreamInput.kt
++++ b/app/src/main/java/com/chiaking/tv/session/StreamInput.kt
+@@ -273,10 +273,16 @@ class StreamInput(val context: Context, val preferences: Preferences)
+         {
+             KeyEvent.KEYCODE_BUTTON_L2 -> {
+                 keyControllerState.l2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
++                // Analog-capable pads also emit MotionEvents. Keep their existing
++                // notification path so this key cannot publish a premature full press.
++                if(event.device?.getMotionRange(MotionEvent.AXIS_LTRIGGER) == null)
++                    controllerStateUpdated()
+                 return true
+             }
+             KeyEvent.KEYCODE_BUTTON_R2 -> {
+                 keyControllerState.r2State = if(event.action == KeyEvent.ACTION_DOWN) UByte.MAX_VALUE else 0U
++                if(event.device?.getMotionRange(MotionEvent.AXIS_RTRIGGER) == null)
++                    controllerStateUpdated()
+                 return true
+             }
+             KeyEvent.KEYCODE_BUTTON_SELECT -> {
+diff --git a/app/src/main/java/com/chiaking/tv/session/StreamManager.kt b/app/src/main/java/com/chiaking/tv/session/StreamManager.kt
+index c5cacb1..2c5de4c 100644
+--- a/app/src/main/java/com/chiaking/tv/session/StreamManager.kt
++++ b/app/src/main/java/com/chiaking/tv/session/StreamManager.kt
+@@ -58,7 +58,8 @@ object StreamManager
+ 			registeredHost.rpRegistKey,
+ 			registeredHost.rpKey,
+ 			preferences.videoProfile,
+-			enableIDROnFECFailure = preferences.idrOnFecFailure
++			enableIDROnFECFailure = preferences.idrOnFecFailure,
++			balancedFramePacing = preferences.balancedFramePacing
+ 		)
+ 		val session = newSession(context, preferences, logManager, connectInfo, registeredHost.psnAccountId)
+ 		this.displayHost = host
+@@ -115,7 +116,8 @@ object StreamManager
+ 			psnAccountId,
+ 			holepunchSessionPtr,
+ 			autoRegist,
+-			enableIDROnFECFailure = preferences.idrOnFecFailure
++			enableIDROnFECFailure = preferences.idrOnFecFailure,
++			balancedFramePacing = preferences.balancedFramePacing
+ 		)
+ 		val session = newSession(context, preferences, logManager, connectInfo)
+ 		this.displayHost = null
+@@ -193,7 +195,8 @@ object StreamManager
+ 		scope.launch {
+ 			try {
+ 				val connectInfo = ConnectInfo(host.isPS5, addr, reg.rpRegistKey, reg.rpKey, preferences.videoProfile,
+-					enableIDROnFECFailure = preferences.idrOnFecFailure)
++					enableIDROnFECFailure = preferences.idrOnFecFailure,
++					balancedFramePacing = preferences.balancedFramePacing)
+ 				val input = StreamInput(context.applicationContext, preferences)
+ 				val s = StreamSession(connectInfo, logManager, preferences.logVerbose, input)
+ 				try
+diff --git a/app/src/main/java/com/chiaking/tv/ui/screens/settings/SettingsViewModel.kt b/app/src/main/java/com/chiaking/tv/ui/screens/settings/SettingsViewModel.kt
+index c043086..6389dac 100644
+--- a/app/src/main/java/com/chiaking/tv/ui/screens/settings/SettingsViewModel.kt
++++ b/app/src/main/java/com/chiaking/tv/ui/screens/settings/SettingsViewModel.kt
+@@ -108,6 +108,7 @@ internal class SettingsViewModel(context: Context, database: AppDatabase, privat
+     var autoConnect by preferenceState({ preferences.autoConnectEnabled }, { preferences.autoConnectEnabled = it })
+     var menuShortcut by preferenceState({ preferences.menuShortcut }, { preferences.menuShortcut = it })
+     var hudItems by preferenceState({ preferences.hudItems }, { preferences.hudItems = it })
++    var balancedFramePacing by preferenceState({ preferences.balancedFramePacing }, { preferences.balancedFramePacing = it })
+     var displayMode by preferenceState({ preferences.displayMode }, { preferences.displayMode = it })
+     var disconnectAction by preferenceState({ preferences.disconnectAction }, { preferences.disconnectAction = it })
+     var uiTheme by preferenceState({ preferences.uiTheme }, { preferences.uiTheme = it; AppThemeState.theme = it })
+diff --git a/app/src/main/java/com/chiaking/tv/ui/screens/settings/StreamSettingsPanel.kt b/app/src/main/java/com/chiaking/tv/ui/screens/settings/StreamSettingsPanel.kt
+index ec88f10..63c23c8 100644
+--- a/app/src/main/java/com/chiaking/tv/ui/screens/settings/StreamSettingsPanel.kt
++++ b/app/src/main/java/com/chiaking/tv/ui/screens/settings/StreamSettingsPanel.kt
+@@ -66,5 +66,12 @@ internal fun SettingsPanelScope.StreamSettingsPanel() {
+             { viewModel.idrOnFec = it },
+             focusRequester = fr(6), onFocus = fb(6)
+         )
++        TvCycleRow(
++            title = stringResource(R.string.frame_pacing),
++            value = stringResource(if (viewModel.balancedFramePacing) R.string.frame_pacing_balanced
++                else R.string.frame_pacing_immediate),
++            onNext = { viewModel.balancedFramePacing = !viewModel.balancedFramePacing },
++            focusRequester = fr(7), onFocus = fb(7)
++        )
+     }
+ }
+diff --git a/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt b/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+index 85a2e75..0d650c3 100644
+--- a/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
++++ b/app/src/main/java/com/metallic/chiaki/lib/Chiaki.kt
+@@ -73,7 +73,8 @@ data class ConnectInfo(
+ 	val psnAccountId: ByteArray? = null,
+ 	val holepunchSessionPtr: Long = 0L,
+ 	val autoRegist: Boolean = false,
+-	val enableIDROnFECFailure: Boolean = false
++	val enableIDROnFECFailure: Boolean = false,
++	val balancedFramePacing: Boolean = false
+ ): Parcelable
+ 
+ private class ChiakiNative
+diff --git a/app/src/main/res/values-de/strings.xml b/app/src/main/res/values-de/strings.xml
+new file mode 100644
+index 0000000..50564ec
+--- /dev/null
++++ b/app/src/main/res/values-de/strings.xml
+@@ -0,0 +1,6 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++	<string name="frame_pacing">Bildausgabe</string>
++	<string name="frame_pacing_immediate">Sofort</string>
++	<string name="frame_pacing_balanced">Ausgeglichen</string>
++</resources>
+diff --git a/app/src/main/res/values-nl/strings.xml b/app/src/main/res/values-nl/strings.xml
+index 59164b5..4042ea7 100644
+--- a/app/src/main/res/values-nl/strings.xml
++++ b/app/src/main/res/values-nl/strings.xml
+@@ -316,4 +316,7 @@
+     <string name="psn_use_for_connections">Standaard</string>
+     <string name="psn_account_count">%1$d van %2$d accounts opgeslagen</string>
+     <string name="psn_account_locked">Verbreek de huidige stream of verbindingspoging voordat je accounts wijzigt.</string>
++	<string name="frame_pacing">Frame-timing</string>
++	<string name="frame_pacing_immediate">Direct</string>
++	<string name="frame_pacing_balanced">Gebalanceerd</string>
+ </resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 1d19ad7..ad58a2a 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -316,4 +316,7 @@
+     <string name="psn_use_for_connections">Default</string>
+     <string name="psn_account_count">%1$d of %2$d accounts saved</string>
+     <string name="psn_account_locked">Disconnect the current stream or connection attempt before changing accounts.</string>
++	<string name="frame_pacing">Frame pacing</string>
++	<string name="frame_pacing_immediate">Immediate</string>
++	<string name="frame_pacing_balanced">Balanced</string>
+ </resources>
+diff --git a/native/CMakeLists.txt b/native/CMakeLists.txt
+index e35956b..e189097 100644
+--- a/native/CMakeLists.txt
++++ b/native/CMakeLists.txt
+@@ -75,9 +75,8 @@ endif()
+ add_subdirectory(${CHIAKI_ROOT}/lib lib)
+ 
+ # Local perf overrides for C core files (see docs/UPSTREAM_SYNC.md):
+-# swap upstream gkcrypt.c/takion.c for our copies in native/overrides and shadow
+-# the public chiaki/gkcrypt.h (BEFORE PUBLIC so chiaki-lib AND all consumers,
+-# e.g. chiaki-jni, see the same struct definition).
++# Swap upstream sources for our copies and use the same GKCrypt layout in the
++# core and its consumers.
+ get_target_property(CHIAKI_LIB_SOURCES chiaki-lib SOURCES)
+ list(FILTER CHIAKI_LIB_SOURCES EXCLUDE REGEX "gkcrypt\\.c$")
+ list(FILTER CHIAKI_LIB_SOURCES EXCLUDE REGEX "takion\\.c$")
+@@ -93,6 +92,10 @@ list(APPEND CHIAKI_LIB_SOURCES
+ 	"${CMAKE_CURRENT_SOURCE_DIR}/overrides/feedbacksender.c")
+ set_target_properties(chiaki-lib PROPERTIES SOURCES "${CHIAKI_LIB_SOURCES}")
+ target_include_directories(chiaki-lib BEFORE PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/overrides/include")
++# Quoted includes from upstream headers search their own directory before -I.
++# Load the override first, so the shared header guard also covers those includes.
++target_compile_options(chiaki-lib PUBLIC
++    "$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-include '${CMAKE_CURRENT_SOURCE_DIR}/overrides/include/chiaki/gkcrypt.h'>")
+ # appended (not BEFORE) so public lib/include still wins; lets the override .c files
+ # find lib/src-local headers like utils.h and chiaki/feedback.h
+ target_include_directories(chiaki-lib PRIVATE "${CHIAKI_ROOT}/lib/src")
+diff --git a/native/jni/audio-decoder.c b/native/jni/audio-decoder.c
+index 35f97e9..8e4935f 100644
+--- a/native/jni/audio-decoder.c
++++ b/native/jni/audio-decoder.c
+@@ -183,7 +183,7 @@ static void android_chiaki_audio_decoder_frame(uint8_t *buf, size_t buf_size, vo
+ 		if(codec_buf_index < 0)
+ 		{
+ 			CHIAKI_LOGE(decoder->log, "Failed to get input audio buffer");
+-			return;
++			goto beach;
+ 		}
+ 
+ 		size_t codec_buf_size;
+@@ -202,4 +202,4 @@ static void android_chiaki_audio_decoder_frame(uint8_t *buf, size_t buf_size, vo
+ 
+ beach:
+ 	chiaki_mutex_unlock(&decoder->codec_mutex);
+-}
+\ No newline at end of file
++}
+diff --git a/native/jni/chiaki-jni.c b/native/jni/chiaki-jni.c
+index 7ea3e02..57faf35 100644
+--- a/native/jni/chiaki-jni.c
++++ b/native/jni/chiaki-jni.c
+@@ -400,7 +400,8 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject
+ 	memset(session, 0, sizeof(AndroidChiakiSession));
+ 	session->log = log;
+ 	err = android_chiaki_video_decoder_init(&session->video_decoder, log, connect_info.video_profile.width, connect_info.video_profile.height,
+-			connect_info.ps5 ? connect_info.video_profile.codec : CHIAKI_CODEC_H264);
++			connect_info.ps5 ? connect_info.video_profile.codec : CHIAKI_CODEC_H264,
++			E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "balancedFramePacing", "Z")));
+ 	if(err != CHIAKI_ERR_SUCCESS)
+ 	{
+ 		free(session);
+diff --git a/native/jni/video-decoder.c b/native/jni/video-decoder.c
+index 2fb4bb6..5a74552 100644
+--- a/native/jni/video-decoder.c
++++ b/native/jni/video-decoder.c
+@@ -8,6 +8,8 @@
+ #include <media/NdkMediaFormat.h>
+ #include <android/native_window_jni.h>
+ #include <android/api-level.h>
++#include <android/choreographer.h>
++#include <android/looper.h>
+ 
+ #include <string.h>
+ #include <chiaki/videoreceiver.h>
+@@ -18,7 +20,7 @@
+ 
+ static void *android_chiaki_video_decoder_output_thread_func(void *user);
+ 
+-ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec)
++ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec, bool balanced_frame_pacing)
+ {
+ 	decoder->log = log;
+ 	decoder->codec = NULL;
+@@ -27,6 +29,7 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
+ 	decoder->target_width = target_width;
+ 	decoder->target_height = target_height;
+ 	decoder->target_codec = codec;
++	decoder->balanced_frame_pacing = balanced_frame_pacing;
+ 	__atomic_store_n(&decoder->shutdown_output, false, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&decoder->surface_valid, false, __ATOMIC_RELEASE);
+ 	__atomic_store_n(&decoder->needs_recreate, false, __ATOMIC_RELEASE);
+@@ -86,7 +89,7 @@ static bool start_codec_locked(AndroidChiakiVideoDecoder *decoder)
+ 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
+ 	if(android_get_device_api_level() >= 30)
+ 		// AMEDIAFORMAT_KEY_LOW_LATENCY is __INTRODUCED_IN(30), so use the literal key with a runtime check
+-		AMediaFormat_setInt32(format, "android.media.key.lowlatency", 1);
++		AMediaFormat_setInt32(format, "low-latency", 1);
+ 
+ 	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
+ 	AMediaFormat_delete(format);
+@@ -303,68 +306,150 @@ beach:
+ 	return r;
+ }
+ 
++typedef struct video_output
++{
++	AndroidChiakiVideoDecoder *decoder;
++	size_t pending[2];
++	size_t count;
++	size_t presented;
++	size_t dropped;
++	int render_failures;
++	bool vsync_pending;
++	bool vsync_ready;
++} VideoOutput;
++
++// The callback is dispatched on the codec output thread's own looper.
++static void video_output_vsync(long frame_time, void *user)
++{
++	(void)frame_time;
++	VideoOutput *output = user;
++	output->vsync_pending = false;
++	output->vsync_ready = true;
++}
++
++static bool video_output_release(VideoOutput *output, size_t index, bool render)
++{
++	AndroidChiakiVideoDecoder *decoder = output->decoder;
++	if(__atomic_load_n(&decoder->shutdown_output, __ATOMIC_ACQUIRE))
++		return false;
++
++	render = render && __atomic_load_n(&decoder->surface_valid, __ATOMIC_ACQUIRE);
++	media_status_t status = AMediaCodec_releaseOutputBuffer(decoder->codec, index, render);
++	if(!render)
++		return true;
++	if(status == AMEDIA_OK)
++	{
++		output->presented++;
++		output->render_failures = 0;
++		return true;
++	}
++	if(++output->render_failures <= 30)
++		return true;
++	CHIAKI_LOGE(decoder->log, "Video Decoder output rendering failed %d times (%d), requesting codec recreation", output->render_failures, (int)status);
++	__atomic_store_n(&decoder->needs_recreate, true, __ATOMIC_RELEASE);
++	return false;
++}
++
++static bool video_output_pop(VideoOutput *output, bool render)
++{
++	size_t index = output->pending[0];
++	output->pending[0] = output->pending[1];
++	output->count--;
++	if(!render)
++		output->dropped++;
++	return video_output_release(output, index, render);
++}
++
+ static void *android_chiaki_video_decoder_output_thread_func(void *user)
+ {
+ 	AndroidChiakiVideoDecoder *decoder = user;
+-	int render_failures = 0;
+-	int dequeue_errors = 0;
++	VideoOutput output = { .decoder = decoder };
++	AChoreographer *choreographer = NULL;
++	if(decoder->balanced_frame_pacing && ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS))
++		choreographer = AChoreographer_getInstance();
++	const size_t capacity = choreographer ? 2 : 1;
++	CHIAKI_LOGI(decoder->log, "Video frame pacing mode=%s", choreographer ? "balanced" : "immediate");
+ 
+-	while(1)
++	int dequeue_errors = 0;
++	size_t drained = 0;
++	while(!__atomic_load_n(&decoder->shutdown_output, __ATOMIC_ACQUIRE))
+ 	{
++		if(choreographer && output.count)
++		{
++			if(!output.vsync_pending && !output.vsync_ready)
++			{
++				output.vsync_pending = true;
++				AChoreographer_postFrameCallback(choreographer, video_output_vsync, &output);
++			}
++			ALooper_pollOnce(0, NULL, NULL, NULL);
++			if(output.vsync_ready)
++			{
++				output.vsync_ready = false;
++				if(!video_output_pop(&output, true))
++					break;
++			}
++		}
++		else if(!choreographer && output.count && drained >= 8)
++		{
++			if(!video_output_pop(&output, true))
++				break;
++			drained = 0;
++		}
++
+ 		AMediaCodecBufferInfo info;
+-		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
++		const int64_t timeout_us = output.count ? (choreographer ? 2000 : 0) : -1;
++		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, timeout_us);
+ 		if(status >= 0)
+ 		{
+ 			dequeue_errors = 0;
+-			if(info.size != 0)
++			bool frame = info.size != 0 && !(info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG);
++			if(frame)
+ 			{
+ 				__atomic_store_n(&decoder->frames_since_output, 0, __ATOMIC_RELAXED);
+ 				__atomic_add_fetch(&decoder->frames_output, 1, __ATOMIC_RELAXED);
+-			}
+-			bool render = info.size != 0 && __atomic_load_n(&decoder->surface_valid, __ATOMIC_ACQUIRE);
+-			media_status_t rr = AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, render);
+-			if(render && rr != AMEDIA_OK)
+-			{
+-				// output surface died under us (e.g. surface destroyed during a background cycle);
+-				// after a short burst the codec will never recover on its own
+-				if(++render_failures > 30)
+-				{
+-					CHIAKI_LOGE(decoder->log, "Video Decoder output rendering failed %d times (%d), requesting codec recreation", render_failures, (int)rr);
+-					__atomic_store_n(&decoder->needs_recreate, true, __ATOMIC_RELEASE);
++				if(output.count == capacity && !video_output_pop(&output, false))
+ 					break;
+-				}
++				output.pending[output.count++] = (size_t)status;
++				drained++;
+ 			}
+-			else if(render)
+-				render_failures = 0;
++			else if(!video_output_release(&output, (size_t)status, false))
++				break;
++
+ 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
+ 			{
++				while(output.count && video_output_pop(&output, output.count == 1))
++					;
+ 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");
+ 				break;
+ 			}
+ 		}
+-		else
++		else if(status == AMEDIACODEC_INFO_TRY_AGAIN_LATER)
+ 		{
+-			chiaki_mutex_lock(&decoder->codec_mutex);
+-			bool shutdown = __atomic_load_n(&decoder->shutdown_output, __ATOMIC_ACQUIRE);
+-			chiaki_mutex_unlock(&decoder->codec_mutex);
+-			if(shutdown)
+-			{
+-				CHIAKI_LOGI(decoder->log, "Video Decoder Output Thread detected shutdown after reported error");
++			if(!choreographer && output.count && !video_output_pop(&output, true))
+ 				break;
+-			}
+-			if(++dequeue_errors > 500)
+-			{
+-				CHIAKI_LOGE(decoder->log, "Video Decoder output thread saw %d consecutive dequeue errors, requesting codec recreation", dequeue_errors);
+-				__atomic_store_n(&decoder->needs_recreate, true, __ATOMIC_RELEASE);
+-				break;
+-			}
++			drained = 0;
++		}
++		else if(status == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED ||
++		        status == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED)
++		{
++			dequeue_errors = 0;
++		}
++		else if(++dequeue_errors > 500)
++		{
++			CHIAKI_LOGE(decoder->log, "Video Decoder output thread saw %d consecutive dequeue errors, requesting codec recreation", dequeue_errors);
++			__atomic_store_n(&decoder->needs_recreate, true, __ATOMIC_RELEASE);
++			break;
+ 		}
+ 	}
+ 
++	while(output.count && video_output_pop(&output, false))
++		;
++	CHIAKI_LOGI(decoder->log, "Video frame pacing samples mode=%s released=%zu superseded=%zu",
++		choreographer ? "balanced" : "immediate", output.presented, output.dropped);
+ 	CHIAKI_LOGI(decoder->log, "Video Decoder Output Thread exiting");
+-
+ 	return NULL;
+ }
++
+ void android_chiaki_video_decoder_get_stats(AndroidChiakiVideoDecoder *decoder, uint64_t *frames, uint64_t *bytes, uint64_t *frames_lost)
+ {
+ 	*frames = __atomic_load_n(&decoder->frames_queued, __ATOMIC_RELAXED);
+diff --git a/native/jni/video-decoder.h b/native/jni/video-decoder.h
+index d546311..0a73930 100644
+--- a/native/jni/video-decoder.h
++++ b/native/jni/video-decoder.h
+@@ -21,6 +21,7 @@ typedef struct android_chiaki_video_decoder_t
+ 	uint64_t timestamp_cur;
+ 	ChiakiThread output_thread;
+ 	bool shutdown_output;
++	bool balanced_frame_pacing;
+ 	bool configuration_pending;
+ 	volatile bool surface_valid;
+ 	volatile bool needs_recreate;
+@@ -36,7 +37,7 @@ typedef struct android_chiaki_video_decoder_t
+ 	uint64_t frames_lost;
+ } AndroidChiakiVideoDecoder;
+ 
+-ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec);
++ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec, bool balanced_frame_pacing);
+ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder);
+ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder, JNIEnv *env, jobject surface);
+ bool android_chiaki_video_decoder_video_sample(uint8_t *buf, size_t buf_size, int32_t frames_lost, bool frame_recovered, void *user);
+diff --git a/native/overrides/include/chiaki/gkcrypt.h b/native/overrides/include/chiaki/gkcrypt.h
+index e1e3f81..922316d 100644
+--- a/native/overrides/include/chiaki/gkcrypt.h
++++ b/native/overrides/include/chiaki/gkcrypt.h
+@@ -1,9 +1,9 @@
+ // SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
+ //
+ // Local copy of external/chiaki-ng/lib/include/chiaki/gkcrypt.h with the
+-// GMAC ctx cache fields. Shadows the upstream header via a BEFORE PUBLIC
+-// include dir in native/CMakeLists.txt. Re-base on upstream at each submodule
+-// bump — see docs/UPSTREAM_SYNC.md.
++// GMAC ctx cache fields. The native build loads this header before the
++// upstream headers so all callers agree on the structure layout. Re-base on
++// upstream at each submodule bump — see docs/UPSTREAM_SYNC.md.
+ 
+ #ifndef CHIAKI_GKCRYPT_H
+ #define CHIAKI_GKCRYPT_H
+diff --git a/native/tests/README-media-input.md b/native/tests/README-media-input.md
+new file mode 100644
+index 0000000..18aa8b5
+--- /dev/null
++++ b/native/tests/README-media-input.md
+@@ -0,0 +1,47 @@
++# Audio input regression test
++
++Run from the repository root after initializing `external/chiaki-ng`:
++
++```sh
++python3 native/tests/run_audio_decoder_input_test.py
++```
++
++Requirements: Linux host, Python 3, a C compiler with AddressSanitizer and
++UndefinedBehaviorSanitizer, pthreads, and the pinned core submodule. No Android
++SDK, PS5, or account is needed for this test.
++
++The test compiles the production `native/jni/audio-decoder.c` callback. A fake
++MediaCodec deterministically refuses the first input buffer or a later buffer;
++the real Chiaki mutex implementation is checked from another pthread after each
++return. Checking from the same thread would miss the bug because this decoder
++uses a recursive mutex. The normal submission case also verifies the bytes and
++timestamps passed into the codec.
++
++It covers:
++
++- calls before a codec exists;
++- timeout before any buffer is acquired;
++- timeout after part of a sample has been submitted;
++- successful submission without sample corruption.
++
++Use `--source /absolute/path/to/audio-decoder.c` to run the same test against
++another source revision. The unpatched 1.28.1-tv source fails the cross-thread
++mutex probe; the patched source passes all four cases.
++
++The `media-stubs/` declarations exist only for this host test. They are not
++included in the APK build. Sanitizers check the exercised host paths;
++LeakSanitizer is off by default because some sandbox tracers cannot run it.
++Callers can override `ASAN_OPTIONS`.
++
++This is not an APK build or a measurement of Android playback latency. Before
++deploying the accompanying fixes, build both ARM ABIs and validate on real
++devices: stream start/stop, background/resume, HEVC and AVC playback, audio
++backpressure/recovery, and primary L2/R2 press/release with a key-only controller.
++The new trigger notifications are limited to devices without the corresponding
++LTRIGGER/RTRIGGER motion axis (including a missing device). Analog-capable pads
++keep the existing motion-event notification path; verify partial presses on a
++DualSense as well. This does not change or fully validate the existing merging
++of digital and analog trigger state.
++For the API-30 low-latency request, inspect the selected codec's capabilities and
++compare enqueue-to-output and frame-presentation timing. A lower end-to-end
++latency must be demonstrated on the target TV rather than inferred from a key.
+diff --git a/native/tests/audio_decoder_input_test.c b/native/tests/audio_decoder_input_test.c
+new file mode 100644
+index 0000000..c743057
+--- /dev/null
++++ b/native/tests/audio_decoder_input_test.c
+@@ -0,0 +1,104 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Exercise the production frame callback with real Chiaki/pthread mutexes and a
++// deterministic codec. No Android runtime, PS5, or account credentials required.
++#include <assert.h>
++#include <stdio.h>
++#include <string.h>
++
++#ifndef CHIAKI_AUDIO_DECODER_SOURCE
++#define CHIAKI_AUDIO_DECODER_SOURCE "../jni/audio-decoder.c"
++#endif
++#include CHIAKI_AUDIO_DECODER_SOURCE
++
++static uint8_t input_buffer[8];
++static uint8_t submitted[32];
++static size_t submitted_size;
++static int dequeue_calls, queue_calls, timeout_on_call;
++
++media_status_t AMediaCodec_delete(AMediaCodec *codec)
++{
++    (void)codec;
++    assert(!"the input test does not own a running codec");
++    return 0;
++}
++
++ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *codec, int64_t timeout_us)
++{
++    assert(codec != NULL);
++    assert(timeout_us == 10000);
++    return ++dequeue_calls == timeout_on_call ? -1 : 0;
++}
++
++uint8_t *AMediaCodec_getInputBuffer(AMediaCodec *codec, size_t index, size_t *size)
++{
++    assert(codec != NULL && index == 0);
++    *size = sizeof(input_buffer);
++    return input_buffer;
++}
++
++media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *codec, size_t index,
++    size_t offset, size_t size, uint64_t time_us, uint32_t flags)
++{
++    assert(codec != NULL && index == 0 && offset == 0 && flags == 0);
++    assert(size <= sizeof(input_buffer));
++    assert(submitted_size + size <= sizeof(submitted));
++    assert(time_us == (uint64_t)queue_calls);
++    memcpy(submitted + submitted_size, input_buffer, size);
++    submitted_size += size;
++    queue_calls++;
++    return 0;
++}
++
++struct LockProbe { ChiakiMutex *mutex; ChiakiErrorCode result; };
++
++static void *probe_from_other_thread(void *user)
++{
++    struct LockProbe *probe = user;
++    probe->result = chiaki_mutex_trylock(probe->mutex);
++    if(probe->result == CHIAKI_ERR_SUCCESS)
++        assert(chiaki_mutex_unlock(probe->mutex) == CHIAKI_ERR_SUCCESS);
++    return NULL;
++}
++
++static void assert_unlocked(ChiakiMutex *mutex)
++{
++    // A same-thread trylock cannot detect a leaked recursive lock. Use another
++    // thread, like session teardown or a later decoder reconfiguration would.
++    struct LockProbe probe = { .mutex = mutex, .result = CHIAKI_ERR_UNKNOWN };
++    ChiakiThread worker;
++    assert(chiaki_thread_create(&worker, probe_from_other_thread, &probe) == CHIAKI_ERR_SUCCESS);
++    assert(chiaki_thread_join(&worker, NULL) == CHIAKI_ERR_SUCCESS);
++    assert(probe.result == CHIAKI_ERR_SUCCESS);
++}
++
++static void run_case(const char *name, bool initialized, int timeout_at, size_t expected_bytes)
++{
++    ChiakiLog log;
++    chiaki_log_init(&log, 0, NULL, NULL);
++    AndroidChiakiAudioDecoder decoder = {0};
++    assert(android_chiaki_audio_decoder_init(&decoder, &log) == CHIAKI_ERR_SUCCESS);
++    decoder.codec = initialized ? (AMediaCodec *)&input_buffer : NULL;
++    uint8_t sample[16];
++    for(size_t i = 0; i < sizeof(sample); i++) sample[i] = (uint8_t)i;
++    dequeue_calls = queue_calls = 0;
++    submitted_size = 0;
++    timeout_on_call = timeout_at;
++
++    android_chiaki_audio_decoder_frame(sample, sizeof(sample), &decoder);
++    assert(submitted_size == expected_bytes);
++    assert(memcmp(sample, submitted, expected_bytes) == 0);
++    assert_unlocked(&decoder.codec_mutex);
++
++    decoder.codec = NULL;
++    android_chiaki_audio_decoder_fini(&decoder);
++    printf("PASS: %s\n", name);
++}
++
++int main(void)
++{
++    run_case("uninitialized codec", false, 0, 0);
++    run_case("timeout before first input buffer", true, 1, 0);
++    run_case("timeout after partial submission", true, 2, 8);
++    run_case("successful submission preserves samples", true, 0, 16);
++    return 0;
++}
+diff --git a/native/tests/media-stubs/jni.h b/native/tests/media-stubs/jni.h
+new file mode 100644
+index 0000000..01ef87c
+--- /dev/null
++++ b/native/tests/media-stubs/jni.h
+@@ -0,0 +1,2 @@
++/* Host regression tests do not cross the JNI boundary. */
++#pragma once
+diff --git a/native/tests/media-stubs/media/NdkMediaCodec.h b/native/tests/media-stubs/media/NdkMediaCodec.h
+new file mode 100644
+index 0000000..1dde78a
+--- /dev/null
++++ b/native/tests/media-stubs/media/NdkMediaCodec.h
+@@ -0,0 +1,27 @@
++/* Minimal NDK declarations for the host audio-input regression test only. */
++#pragma once
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++#include "NdkMediaFormat.h"
++typedef struct AMediaCodec AMediaCodec;
++typedef struct AMediaCodecBufferInfo {
++    int32_t offset, size;
++    int64_t presentationTimeUs;
++    uint32_t flags;
++} AMediaCodecBufferInfo;
++#define AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM 4
++AMediaCodec *AMediaCodec_createDecoderByType(const char *mime);
++media_status_t AMediaCodec_delete(AMediaCodec *codec);
++media_status_t AMediaCodec_configure(AMediaCodec *codec, const AMediaFormat *format,
++    void *surface, void *crypto, uint32_t flags);
++media_status_t AMediaCodec_start(AMediaCodec *codec);
++ssize_t AMediaCodec_dequeueInputBuffer(AMediaCodec *codec, int64_t timeout_us);
++uint8_t *AMediaCodec_getInputBuffer(AMediaCodec *codec, size_t index, size_t *size);
++media_status_t AMediaCodec_queueInputBuffer(AMediaCodec *codec, size_t index,
++    size_t offset, size_t size, uint64_t time_us, uint32_t flags);
++ssize_t AMediaCodec_dequeueOutputBuffer(AMediaCodec *codec, AMediaCodecBufferInfo *info,
++    int64_t timeout_us);
++uint8_t *AMediaCodec_getOutputBuffer(AMediaCodec *codec, size_t index, size_t *size);
++media_status_t AMediaCodec_releaseOutputBuffer(AMediaCodec *codec, size_t index, bool render);
+diff --git a/native/tests/media-stubs/media/NdkMediaFormat.h b/native/tests/media-stubs/media/NdkMediaFormat.h
+new file mode 100644
+index 0000000..6adef42
+--- /dev/null
++++ b/native/tests/media-stubs/media/NdkMediaFormat.h
+@@ -0,0 +1,12 @@
++/* Minimal NDK declarations for the host audio-input regression test only. */
++#pragma once
++#include <stdint.h>
++typedef int32_t media_status_t;
++typedef struct AMediaFormat AMediaFormat;
++#define AMEDIAFORMAT_KEY_MIME "mime"
++#define AMEDIAFORMAT_KEY_CHANNEL_COUNT "channel-count"
++#define AMEDIAFORMAT_KEY_SAMPLE_RATE "sample-rate"
++AMediaFormat *AMediaFormat_new(void);
++media_status_t AMediaFormat_delete(AMediaFormat *format);
++void AMediaFormat_setString(AMediaFormat *format, const char *name, const char *value);
++void AMediaFormat_setInt32(AMediaFormat *format, const char *name, int32_t value);
+diff --git a/native/tests/run_audio_decoder_input_test.py b/native/tests/run_audio_decoder_input_test.py
+new file mode 100644
+index 0000000..e811145
+--- /dev/null
++++ b/native/tests/run_audio_decoder_input_test.py
+@@ -0,0 +1,38 @@
++#!/usr/bin/env python3
++"""Host regression test of the real audio callback; requires cc and the core submodule.
++
++The NDK is stubbed only at the codec boundary. Chiaki mutexes use real pthreads.
++This does not replace an Android build or streaming test on physical hardware.
++Pass --source /path/to/audio-decoder.c to confirm an earlier source fails the test.
++"""
++from pathlib import Path
++import argparse
++import os
++import subprocess
++import tempfile
++
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument("--source", type=Path)
++args = parser.parse_args()
++root = Path(__file__).resolve().parents[2]
++core = root / "external/chiaki-ng/lib"
++if not (core / "src/thread.c").exists():
++    parser.error("initialize external/chiaki-ng with git submodule update --init first")
++
++with tempfile.TemporaryDirectory(prefix="chiaki-audio-input-") as directory:
++    executable = Path(directory) / "audio-input-test"
++    command = [os.environ.get("CC", "cc"), "-std=gnu11", "-O1", "-g", "-pthread",
++               "-Wall", "-Wextra", "-ffunction-sections", "-fdata-sections",
++               "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-Wl,--gc-sections",
++               f"-I{root / 'native/tests/media-stubs'}", f"-I{root / 'native/jni'}",
++               f"-I{core / 'include'}"]
++    if args.source:
++        command.append(f'-DCHIAKI_AUDIO_DECODER_SOURCE="{args.source.resolve()}"')
++    command += [str(root / "native/tests/audio_decoder_input_test.c"),
++                str(core / "src/thread.c"), str(core / "src/time.c"), str(core / "src/log.c"),
++                "-o", str(executable)]
++    subprocess.run(command, check=True)
++    subprocess.run([str(executable)], check=True, timeout=10,
++                   env=dict(os.environ, UBSAN_OPTIONS="halt_on_error=1",
++                            # LeakSanitizer cannot run under some sandbox tracers.
++                            ASAN_OPTIONS=os.environ.get("ASAN_OPTIONS", "detect_leaks=0:abort_on_error=1")))

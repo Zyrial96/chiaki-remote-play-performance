@@ -1,0 +1,1767 @@
+diff --git a/doc/performance-videotoolbox-benchmark.md b/doc/performance-videotoolbox-benchmark.md
+new file mode 100644
+index 0000000..e517798
+--- /dev/null
++++ b/doc/performance-videotoolbox-benchmark.md
+@@ -0,0 +1,68 @@
++# VideoToolbox copy-versus-map experiment
++
++This is a standalone, bounded microbenchmark for an Apple Silicon Mac with
++Homebrew FFmpeg already installed. It is not part of the normal CMake build or
++test suite and does not launch Chiaki, connect to a console, change settings,
++decode video, or modify an installed application.
++
++## Status
++
++The C source compiles with C11 and `-Wall -Wextra -Werror` against FFmpeg 7.1 on
++Linux. **No Apple hardware execution or timing measurements have been obtained.**
++The attempted read-only Mac environment probe did not receive a device response.
++Consequently, this file does not claim that mapping works on the intended Mac,
++that it is faster, or that it improves Remote Play latency.
++
++## Build and run on the Mac
++
++With the standard Apple Silicon Homebrew installation:
++
++```sh
++clang -std=c11 -O2 -Wall -Wextra -Werror \
++  -I/opt/homebrew/opt/ffmpeg/include scripts/benchmark-videotoolbox.c \
++  -L/opt/homebrew/opt/ffmpeg/lib -lavutil \
++  -o /tmp/chiaki-vt-benchmark
++/tmp/chiaki-vt-benchmark > /tmp/chiaki-vt-benchmark.json
++```
++
++For another Homebrew prefix, replace both include and library paths with its
++installed FFmpeg prefix. No package installation is performed by this command.
++Compile/run only this standalone program; it is not a patched app installer.
++
++## What it measures
++
++For each of NV12 and P010 at 1920×1080, the program allocates a pool of eight
++VideoToolbox frames and fills deterministic plane contents. It alternates the
++order of two operations over 50 warm-up pairs followed by 400 measured pairs:
++
++| Operation | Included work |
++| --- | --- |
++| `copy` | Allocate an AVFrame, call `av_hwframe_transfer_data`, copy frame properties |
++| `readonly_map` | Allocate an AVFrame and call `av_hwframe_map` with `AV_HWFRAME_MAP_READ` |
++
++The JSON reports p50/p95/p99/max in microseconds for preparation, and separately
++for preparation plus frame release/unmapping. Plane sampling/validation time is
++excluded. Initial device/pool allocation and filling are outside the timed loop.
++Each result is checked for format, dimensions, strides and sample pixel values.
++A separate check clones a mapped frame, releases its source-frame and original
++mapping references, then validates the retained clone before releasing it.
++
++On the success path, every output, mapping, clone and pool frame is explicitly
++freed, followed by the frames context and device references. A failure aborts
++the standalone process with an error on stderr; do not treat its possibly
++partial stdout as a completed result. Apple-specific allocation, mapping and
++unmapping behavior still requires an actual runtime test.
++
++## Limits and interpretation
++
++This uses allocated, warm VideoToolbox buffers, not buffers produced by the
++PS5 decoder under load. It excludes decoder work, GPU upload, rendering,
++presentation/compositor queues, scanout, networking and controller input. A
++smaller preparation time would be evidence for removing one CPU copy, not a
++measurement of button-to-screen improvement or complete GPU zero-copy.
++
++Before using a read-only mapping path in the app, validate NV12/P010 visual
++correctness, buffer ownership until asynchronous GPU upload finishes, buffer
++pool pressure, CoreVideo lock duration, repeated reconnect/teardown, and real
++streaming frame-time distributions on the target Mac. Keep a tested transfer
++fallback for unsupported formats or mapping failure.
+diff --git a/gui/CMakeLists.txt b/gui/CMakeLists.txt
+index 7e777e1..cc9f436 100755
+--- a/gui/CMakeLists.txt
++++ b/gui/CMakeLists.txt
+@@ -78,6 +78,8 @@ if(APPLE)
+ 	list(APPEND SOURCE_FILES
+ 		include/macMicPermission.h
+ 		src/macMicPermission.m
++		include/macVideoFrames.h
++		src/macVideoFrames.mm
+ 		include/macWakeSleep.h
+ 		src/macWakeSleep.cpp
+ 	)
+@@ -139,7 +141,7 @@ if(NOT CHIAKI_ENABLE_FFMPEG_DECODER)
+ 	message(FATAL_ERROR "Chiaki GUI requires CHIAKI_ENABLE_FFMPEG_DECODER=ON")
+ endif()
+ if(APPLE)
+-	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit")
++	target_link_libraries(chiaki "-framework AVFoundation" "-framework IOKit" "-framework CoreVideo" "-framework Metal")
+ endif()
+ 
+ # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fanalyzer")
+diff --git a/gui/include/macVideoFrames.h b/gui/include/macVideoFrames.h
+new file mode 100644
+index 0000000..834d007
+--- /dev/null
++++ b/gui/include/macVideoFrames.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <libplacebo/vulkan.h>
++
++struct AVFrame;
++struct pl_frame;
++struct MacVideoFrames;
++
++// All calls take place on the renderer thread, or after it has stopped.
++MacVideoFrames *createMacVideoFrames(pl_vulkan vulkan);
++void destroyMacVideoFrames(MacVideoFrames *frames);
++bool importMacVideoFrame(MacVideoFrames *frames, AVFrame *source, pl_frame *mapped);
++void retireMacVideoFrame(MacVideoFrames *frames);
+diff --git a/gui/include/qmlbackend.h b/gui/include/qmlbackend.h
+index 0b0f466..56eeced 100644
+--- a/gui/include/qmlbackend.h
++++ b/gui/include/qmlbackend.h
+@@ -15,12 +15,14 @@
+ #include <QFutureWatcher>
+ #include <QFuture>
+ #include <QAtomicInteger>
++#include <memory>
+ #ifdef CHIAKI_HAVE_WEBENGINE
+ #include <QQuickWebEngineProfile>
+ #include <QWebEngineUrlRequestInterceptor>
+ #endif
+ 
+ class SystemdInhibit;
++class VideoFrameMailbox;
+ #ifdef Q_OS_MACOS
+     class MacWakeSleep;
+ #elif defined(Q_OS_WINDOWS)
+@@ -171,7 +173,7 @@ public:
+     void setIsAppActive();
+ 
+     void profileChanged();
+-    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer);
++    bool prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer, bool import_metal);
+     void prepareStartupPresentation(bool present_warmup);
+     void applyStartupWindowSizing();
+ 
+@@ -288,6 +290,7 @@ private:
+     QmlMainWindow *window = {};
+     StreamSession *session = {};
+     QThread *frame_thread = {};
++    std::shared_ptr<VideoFrameMailbox> frame_mailbox;
+     QTimer *psn_reconnect_timer = {};
+     QTimer *psn_auto_connect_timer = {};
+     QTimer *wakeup_start_timer = {};
+diff --git a/gui/include/qmlmainwindow.h b/gui/include/qmlmainwindow.h
+index 5a54616..aa4ab35 100644
+--- a/gui/include/qmlmainwindow.h
++++ b/gui/include/qmlmainwindow.h
+@@ -51,6 +51,9 @@ class QFrame;
+ class StatsOverlayWidget;
+ class BufferedPlaybackPacerThread;
+ class DeferredPresentPacerThread;
++#ifdef Q_OS_MACOS
++struct MacVideoFrames;
++#endif
+ class DeferredSwapThread;
+ 
+ class QmlMainWindow : public QWindow
+@@ -168,6 +171,7 @@ public slots:
+     void presentFrame(ChiakiFfmpegFrame frame, int32_t frames_lost, qint64 decoder_delivery_us = 0);
+ 
+     AVBufferRef *vulkanHwDeviceCtx();
++    bool directFrameMappingEnabled() const { return bypass_frame_queue; }
+ 
+ signals:
+     void hasVideoChanged();
+@@ -293,6 +297,13 @@ private:
+     QMutex direct_frame_mutex;
+     AVFrame *direct_pending_frame = nullptr;
+     struct pl_frame direct_frame = {};
++    bool mapDirectFrame(AVFrame *incoming);
++    void clearDirectFrame();
++#ifdef Q_OS_MACOS
++    MacVideoFrames *mac_video_frames = nullptr;
++    bool mac_video_frame_active = false;
++    bool mac_video_import_failed = false;
++#endif
+     QAtomicInteger<int> direct_frame_reset = 0;
+     uint64_t ts_start = 0;
+     double queue_pts_origin = -1.0;
+diff --git a/gui/include/videoframemailbox.h b/gui/include/videoframemailbox.h
+new file mode 100644
+index 0000000..a825ece
+--- /dev/null
++++ b/gui/include/videoframemailbox.h
+@@ -0,0 +1,110 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++#pragma once
++
++#include <chiaki/ffmpegdecoder.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <limits>
++#include <mutex>
++#include <utility>
++
++// Bounds the frame-thread -> GUI-thread handoff before the renderer's own queue.
++// The producer schedules a GUI callback only when push() returns true. That
++// callback takes the newest frame, rather than retaining one AVFrame per event.
++class VideoFrameMailbox
++{
++public:
++    struct Frame
++    {
++        ChiakiFfmpegFrame frame = {};
++        int32_t frames_lost = 0;
++        int64_t delivery_us = 0;
++
++        Frame() = default;
++        Frame(ChiakiFfmpegFrame frame, int32_t frames_lost, int64_t delivery_us)
++            : frame(frame), frames_lost(frames_lost), delivery_us(delivery_us) {}
++
++        ~Frame() { av_frame_free(&frame.frame); }
++        Frame(const Frame &) = delete;
++        Frame &operator=(const Frame &) = delete;
++
++        Frame(Frame &&other) noexcept
++            : frame(other.frame), frames_lost(other.frames_lost), delivery_us(other.delivery_us)
++        {
++            other.frame.frame = nullptr;
++        }
++
++        Frame &operator=(Frame &&other) noexcept
++        {
++            if (this != &other) {
++                av_frame_free(&frame.frame);
++                frame = other.frame;
++                frames_lost = other.frames_lost;
++                delivery_us = other.delivery_us;
++                other.frame.frame = nullptr;
++            }
++            return *this;
++        }
++
++        ChiakiFfmpegFrame release()
++        {
++            const ChiakiFfmpegFrame result = frame;
++            frame.frame = nullptr;
++            return result;
++        }
++    };
++
++    bool push(Frame incoming)
++    {
++        Frame discarded;
++        bool notify;
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            if (!active || !incoming.frame.frame)
++                return false;
++            if (pending.frame.frame) {
++                // Preserve upstream loss and recovery information when replacing
++                // a frame, and count the superseded decoded frame exactly once.
++                const int64_t lost = static_cast<int64_t>(incoming.frames_lost)
++                    + pending.frames_lost + 1;
++                incoming.frames_lost = static_cast<int32_t>(std::min<int64_t>(
++                    lost, std::numeric_limits<int32_t>::max()));
++                incoming.frame.recovered = incoming.frame.recovered || pending.frame.recovered;
++            }
++            discarded = std::move(pending);
++            pending = std::move(incoming);
++            notify = !notification_pending;
++            notification_pending = true;
++        }
++        // Release superseded hardware/software buffers outside the mailbox lock.
++        return notify;
++    }
++
++    Frame take()
++    {
++        std::lock_guard<std::mutex> lock(mutex);
++        notification_pending = false;
++        return std::move(pending);
++    }
++
++    // Each streaming session uses a separate mailbox. Cancellation makes any
++    // already queued GUI callback harmless after session teardown/reconnect.
++    void cancel()
++    {
++        Frame discarded;
++        {
++            std::lock_guard<std::mutex> lock(mutex);
++            active = false;
++            notification_pending = false;
++            discarded = std::move(pending);
++        }
++    }
++
++private:
++    std::mutex mutex;
++    Frame pending;
++    bool active = true;
++    bool notification_pending = false;
++};
+diff --git a/gui/src/macVideoFrames.mm b/gui/src/macVideoFrames.mm
+new file mode 100644
+index 0000000..755e142
+--- /dev/null
++++ b/gui/src/macVideoFrames.mm
+@@ -0,0 +1,190 @@
++#import <CoreVideo/CoreVideo.h>
++#import <Metal/Metal.h>
++
++#define VK_USE_PLATFORM_METAL_EXT
++#include "macVideoFrames.h"
++
++#define PL_LIBAV_IMPLEMENTATION 0
++#include <libplacebo/utils/libav.h>
++
++extern "C" {
++#include <libavutil/frame.h>
++#include <libavutil/hwcontext.h>
++}
++
++#include <array>
++#include <deque>
++#include <limits>
++#include <memory>
++
++#if PL_API_VER >= 387 && defined(VK_EXT_metal_objects)
++namespace {
++struct ImportedFrame {
++    pl_gpu gpu;
++    AVFrame *source = nullptr;
++    std::array<CVMetalTextureRef, 2> views{};
++    std::array<pl_tex, 2> textures{};
++
++    explicit ImportedFrame(pl_gpu gpu) : gpu(gpu) {}
++    ~ImportedFrame()
++    {
++        for (size_t plane = 0; plane < textures.size(); ++plane) {
++            pl_tex_destroy(gpu, &textures[plane]);
++            if (views[plane])
++                CFRelease(views[plane]);
++        }
++        av_frame_free(&source);
++    }
++
++    bool busy() const
++    {
++        for (pl_tex texture : textures) {
++            if (pl_tex_poll(gpu, texture, 0))
++                return true;
++        }
++        return false;
++    }
++
++    void wait() const
++    {
++        for (pl_tex texture : textures) {
++            while (pl_tex_poll(gpu, texture, std::numeric_limits<uint64_t>::max())) {
++            }
++        }
++    }
++};
++}
++
++struct MacVideoFrames {
++    pl_gpu gpu;
++    CVMetalTextureCacheRef cache = nullptr;
++    std::unique_ptr<ImportedFrame> active;
++    std::deque<std::unique_ptr<ImportedFrame>> retired;
++
++    explicit MacVideoFrames(pl_gpu gpu) : gpu(gpu) {}
++    ~MacVideoFrames()
++    {
++        if (active || !retired.empty())
++            pl_gpu_finish(gpu);
++        active.reset();
++        retired.clear();
++        if (cache)
++            CFRelease(cache);
++    }
++};
++
++MacVideoFrames *createMacVideoFrames(pl_vulkan vulkan)
++{
++    if (!vulkan || !(vulkan->gpu->import_caps.tex & PL_HANDLE_MTL_TEX))
++        return nullptr;
++
++    auto exportObjects = reinterpret_cast<PFN_vkExportMetalObjectsEXT>(
++        vulkan->get_proc_addr(vulkan->instance, "vkExportMetalObjectsEXT"));
++    if (!exportObjects)
++        return nullptr;
++
++    @autoreleasepool {
++        VkExportMetalDeviceInfoEXT device{};
++        device.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_DEVICE_INFO_EXT;
++        VkExportMetalObjectsInfoEXT info{};
++        info.sType = VK_STRUCTURE_TYPE_EXPORT_METAL_OBJECTS_INFO_EXT;
++        info.pNext = &device;
++        exportObjects(vulkan->device, &info);
++        auto result = std::make_unique<MacVideoFrames>(vulkan->gpu);
++        if (!device.mtlDevice || CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr,
++                     device.mtlDevice, nullptr, &result->cache) != kCVReturnSuccess)
++            return nullptr;
++        return result.release();
++    }
++}
++
++void destroyMacVideoFrames(MacVideoFrames *frames)
++{
++    delete frames;
++}
++
++void retireMacVideoFrame(MacVideoFrames *frames)
++{
++    if (!frames || !frames->active)
++        return;
++
++    frames->retired.push_back(std::move(frames->active));
++    while (!frames->retired.empty() && !frames->retired.front()->busy())
++        frames->retired.pop_front();
++
++    // CoreVideo may recycle a decoder surface as soon as its AVFrame is released.
++    // Keep it until Vulkan finishes sampling, with a hard bound on decoder surfaces.
++    if (frames->retired.size() == 3) {
++        frames->retired.front()->wait();
++        frames->retired.pop_front();
++    }
++}
++
++bool importMacVideoFrame(MacVideoFrames *frames, AVFrame *source, pl_frame *mapped)
++{
++    if (!frames || !source->data[3] || !source->hw_frames_ctx)
++        return false;
++
++    auto buffer = reinterpret_cast<CVPixelBufferRef>(source->data[3]);
++    const OSType format = CVPixelBufferGetPixelFormatType(buffer);
++    const bool tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
++                        format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++    const bool fullRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
++                           format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
++    if ((!tenBit && !fullRange && format != kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) ||
++        CVPixelBufferGetPlaneCount(buffer) != 2)
++        return false;
++
++    @autoreleasepool {
++        auto imported = std::make_unique<ImportedFrame>(frames->gpu);
++        imported->source = av_frame_clone(source);
++        if (!imported->source)
++            return false;
++
++        for (size_t plane = 0; plane < imported->textures.size(); ++plane) {
++            const bool luma = plane == 0;
++            const MTLPixelFormat metalFormat = tenBit
++                ? (luma ? MTLPixelFormatR16Unorm : MTLPixelFormatRG16Unorm)
++                : (luma ? MTLPixelFormatR8Unorm : MTLPixelFormatRG8Unorm);
++            const size_t width = CVPixelBufferGetWidthOfPlane(buffer, plane);
++            const size_t height = CVPixelBufferGetHeightOfPlane(buffer, plane);
++            if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, frames->cache,
++                    buffer, nullptr, metalFormat, width, height, plane,
++                    &imported->views[plane]) != kCVReturnSuccess)
++                return false;
++
++            pl_tex_params params{};
++            params.w = static_cast<int>(width);
++            params.h = static_cast<int>(height);
++            params.format = pl_find_named_fmt(frames->gpu,
++                tenBit ? (luma ? "r16" : "rg16") : (luma ? "r8" : "rg8"));
++            params.sampleable = true;
++            params.import_handle = PL_HANDLE_MTL_TEX;
++            params.shared_mem.handle.handle = (__bridge void *)CVMetalTextureGetTexture(imported->views[plane]);
++            if (!params.format || !params.shared_mem.handle.handle)
++                return false;
++            imported->textures[plane] = pl_tex_create(frames->gpu, &params);
++            if (!imported->textures[plane])
++                return false;
++        }
++
++        // Use the actual CoreVideo format for the plane layout and bit alignment.
++        AVFrame description = *imported->source;
++        description.format = tenBit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
++        if (description.color_range == AVCOL_RANGE_UNSPECIFIED)
++            description.color_range = fullRange ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
++        pl_frame_from_avframe(mapped, &description);
++        mapped->repr.bits.sample_depth = tenBit ? 16 : 8;
++        mapped->repr.bits.bit_shift = tenBit ? 6 : 0;
++        for (size_t plane = 0; plane < imported->textures.size(); ++plane)
++            mapped->planes[plane].texture = imported->textures[plane];
++        frames->active = std::move(imported);
++        return true;
++    }
++}
++#else
++MacVideoFrames *createMacVideoFrames(pl_vulkan) { return nullptr; }
++void destroyMacVideoFrames(MacVideoFrames *) {}
++bool importMacVideoFrame(MacVideoFrames *, AVFrame *, pl_frame *) { return false; }
++void retireMacVideoFrame(MacVideoFrames *) {}
++#endif
+diff --git a/gui/src/main.cpp b/gui/src/main.cpp
+index 77dbe8f..a133ac6 100644
+--- a/gui/src/main.cpp
++++ b/gui/src/main.cpp
+@@ -85,8 +85,12 @@ int real_main(int argc, char *argv[])
+ 	// The Vulkan loader also reads Homebrew's driver folder, so with Homebrew's molten-vk installed
+ 	// the app loaded a second MoltenVK beside its own and listed every GPU twice. Use only the
+ 	// bundled one. Setting any of these variables yourself keeps your choice.
+-	const QString moltenvk_icd = QFileInfo(QString::fromLocal8Bit(argv[0])).canonicalPath()
+-		+ "/../Resources/vulkan/icd.d/MoltenVK_icd.json";
++	const QString executable_dir = QFileInfo(QString::fromLocal8Bit(argv[0])).canonicalPath();
++	const QString moltenvk_icd = executable_dir + "/../Resources/vulkan/icd.d/MoltenVK_icd.json";
++	// Qt opens its Vulkan loader dynamically, so point it at the bundled copy.
++	const QFileInfo vulkan_loader(executable_dir + "/../Frameworks/libvulkan.1.dylib");
++	if(!qEnvironmentVariableIsSet("QT_VULKAN_LIB") && vulkan_loader.exists())
++		qputenv("QT_VULKAN_LIB", vulkan_loader.canonicalFilePath().toUtf8());
+ 	if(QFileInfo::exists(moltenvk_icd) && !qEnvironmentVariableIsSet("VK_DRIVER_FILES")
+ 		&& !qEnvironmentVariableIsSet("VK_ICD_FILENAMES") && !qEnvironmentVariableIsSet("VK_LOADER_DRIVERS_SELECT")
+ 		&& !qEnvironmentVariableIsSet("VK_LOADER_DRIVERS_DISABLE"))
+diff --git a/gui/src/qmlbackend.cpp b/gui/src/qmlbackend.cpp
+index d188a79..158d3bc 100644
+--- a/gui/src/qmlbackend.cpp
++++ b/gui/src/qmlbackend.cpp
+@@ -6,6 +6,7 @@
+ #include "psnaccountid.h"
+ #include "psntoken.h"
+ #include "systemdinhibit.h"
++#include "videoframemailbox.h"
+ #include "chiaki/remote/holepunch.h"
+ #ifdef Q_OS_MACOS
+ #include "macWakeSleep.h"
+@@ -36,6 +37,7 @@
+ extern "C" {
+ #include <chiaki/time.h>
+ #include <libavcodec/avcodec.h>
++#include <libavutil/hwcontext.h>
+ #include <libavutil/pixdesc.h>
+ #include <libavutil/pixfmt.h>
+ }
+@@ -450,7 +452,12 @@ QmlBackend::QmlBackend(Settings *settings, QmlMainWindow *window)
+     refreshPsnToken();
+ }
+ 
+-bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer)
++#ifdef Q_OS_MACOS
++static QAtomicInt videotoolbox_mapping_in_use = 0;
++static uint8_t videotoolbox_mapping_marker;
++#endif
++
++bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_opengl_renderer, bool import_metal)
+ {
+     if (!frame.frame)
+         return false;
+@@ -461,10 +468,48 @@ bool QmlBackend::prepareFrameForPresentation(ChiakiFfmpegFrame &frame, bool use_
+     if (!frame.frame->hw_frames_ctx)
+         return frame_has_planes(frame.frame);
+ 
++    if (import_metal && !disable_zero_copy && frame.frame->format == AV_PIX_FMT_VIDEOTOOLBOX)
++        return frame.frame->data[3] != nullptr;
++
+     const bool direct_render = !disable_zero_copy && frame_can_use_direct_render(frame.frame, use_opengl_renderer);
+     if (direct_render)
+         return frame_has_planes(frame.frame);
+ 
++#ifdef Q_OS_MACOS
++    static const bool map_videotoolbox = qEnvironmentVariableIntValue("CHIAKI_VIDEOTOOLBOX_MAP") == 1;
++    if (map_videotoolbox && !disable_zero_copy && frame.frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
++        const auto *context = reinterpret_cast<const AVHWFramesContext *>(frame.frame->hw_frames_ctx->data);
++        // Keep a single mapping in flight so snapshots and queued frames do not exhaust decoder buffers.
++        if (!frame.frame->opaque_ref &&
++            (context->sw_format == AV_PIX_FMT_NV12 || context->sw_format == AV_PIX_FMT_P010LE) &&
++            videotoolbox_mapping_in_use.testAndSetAcquire(0, 1)) {
++            AVFrame *mapped = av_frame_alloc();
++            if (mapped) {
++                // The mapping retains the source buffer until the renderer releases its final reference.
++                if (av_hwframe_map(mapped, frame.frame, AV_HWFRAME_MAP_READ) >= 0 &&
++                    mapped->format == context->sw_format && !mapped->hw_frames_ctx &&
++                    mapped->data[0] && mapped->data[1] && mapped->linesize[0] > 0 && mapped->linesize[1] > 0) {
++                    mapped->opaque_ref = av_buffer_create(&videotoolbox_mapping_marker, 1,
++                        [](void *, uint8_t *) { videotoolbox_mapping_in_use.storeRelease(0); },
++                        nullptr, AV_BUFFER_FLAG_READONLY);
++                }
++                if (mapped->opaque_ref) {
++                    static const bool logged = [] {
++                        qCInfo(chiakiGui) << "Presenting read-only VideoToolbox mappings";
++                        return true;
++                    }();
++                    Q_UNUSED(logged);
++                    av_frame_free(&frame.frame);
++                    frame.frame = mapped;
++                    return true;
++                }
++                av_frame_free(&mapped);
++            }
++            videotoolbox_mapping_in_use.storeRelease(0);
++        }
++    }
++#endif
++
+     const int format = frame.frame->format;
+     {
+         QMutexLocker locker(&hw_transfer_state_mutex);
+@@ -541,6 +586,13 @@ void QmlBackend::teardownSession()
+         QMetaObject::invokeMethod(frame_ctx, []() {}, Qt::BlockingQueuedConnection);
+     }
+ 
++    // Queued GUI delivery callbacks can outlive this session. Invalidate their
++    // mailbox after the producer has stopped, releasing any undelivered frame.
++    if (frame_mailbox) {
++        frame_mailbox->cancel();
++        frame_mailbox.reset();
++    }
++
+     // 3) Safe now: schedule the deferred delete and drop the member.
+     session->deleteLater();
+     session = nullptr;
+@@ -1120,8 +1172,17 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+         return;
+     }
+ 
+-    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, use_opengl_renderer]() {
+-        ChiakiFfmpegDecoder *decoder = session->GetFfmpegDecoder();
++    frame_mailbox = std::make_shared<VideoFrameMailbox>();
++    const auto mailbox = frame_mailbox;
++    StreamSession *frame_session = session;
++#ifdef Q_OS_MACOS
++    const bool import_metal = !use_opengl_renderer && window->directFrameMappingEnabled() &&
++                              qEnvironmentVariableIntValue("CHIAKI_VIDEOTOOLBOX_METAL") == 1;
++#else
++    const bool import_metal = false;
++#endif
++    connect(session, &StreamSession::FfmpegFrameAvailable, frame_thread->parent(), [this, frame_session, mailbox, use_opengl_renderer, import_metal]() {
++        ChiakiFfmpegDecoder *decoder = frame_session->GetFfmpegDecoder();
+         if (!decoder) {
+             qCCritical(chiakiGui) << "Session has no FFmpeg decoder";
+             return;
+@@ -1136,12 +1197,21 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+             pending_recovered_frame.storeRelaxed(1);
+ 
+         const qint64 prepare_begin_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+-        if (!prepareFrameForPresentation(frame, use_opengl_renderer))
++        if (!prepareFrameForPresentation(frame, use_opengl_renderer, import_metal))
+         {
+             av_frame_free(&frame.frame);
+             return;
+         }
+         const qint64 prepare_end_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
++#ifdef Q_OS_MACOS
++        static const bool measure_prepare = qEnvironmentVariableIntValue("CHIAKI_MEASURE_FRAME_PREPARE") == 1;
++        if (measure_prepare) {
++            const auto *marker = frame.frame->opaque_ref;
++            const bool mapped = marker && marker->data == &videotoolbox_mapping_marker;
++            qCInfo(chiakiGui).nospace() << "[frame-prepare] us=" << (prepare_end_us - prepare_begin_us)
++                                      << " mapped=" << (mapped ? 1 : 0);
++        }
++#endif
+         if (prepare_end_us >= prepare_begin_us && prepare_end_us - prepare_begin_us >= 5000) {
+             CHIAKI_NOISY_DEBUG().nospace()
+                 << "[decode] prepare_frame_us=" << (prepare_end_us - prepare_begin_us)
+@@ -1154,9 +1224,15 @@ void QmlBackend::createSession(const StreamSessionConnectInfo &connect_info)
+ 
+         const qint64 delivery_us = static_cast<qint64>(chiaki_time_now_monotonic_us());
+         QmlMainWindow *target_window = window;
+-        QMetaObject::invokeMethod(target_window, [target_window, frame, frames_lost, delivery_us]() mutable {
+-            target_window->presentFrame(frame, frames_lost, delivery_us);
+-        });
++        if (mailbox->push(VideoFrameMailbox::Frame(frame, frames_lost, delivery_us))) {
++            const bool queued = QMetaObject::invokeMethod(target_window, [target_window, mailbox]() {
++                auto delivery = mailbox->take();
++                if (delivery.frame.frame)
++                    target_window->presentFrame(delivery.release(), delivery.frames_lost, delivery.delivery_us);
++            }, Qt::QueuedConnection);
++            if (!queued)
++                mailbox->cancel();
++        }
+     });
+ 
+     StreamSession *session_for_connections = session;
+diff --git a/gui/src/qmlmainwindow.cpp b/gui/src/qmlmainwindow.cpp
+index 93e0afa..76a8d74 100644
+--- a/gui/src/qmlmainwindow.cpp
++++ b/gui/src/qmlmainwindow.cpp
+@@ -62,6 +62,7 @@ extern "C" {
+ #include <utility>
+ #include <atomic>
+ #if defined(Q_OS_MACOS)
++#include "macVideoFrames.h"
+ #include <objc/message.h>
+ #include <objc/runtime.h>
+ #endif
+@@ -2509,6 +2510,66 @@ pl_gpu QmlMainWindow::placeboGpu() const
+     return nullptr;
+ }
+ 
++void QmlMainWindow::clearDirectFrame()
++{
++#ifdef Q_OS_MACOS
++    if (mac_video_frame_active) {
++        retireMacVideoFrame(mac_video_frames);
++        mac_video_frame_active = false;
++    } else
++#endif
++    {
++        pl_unmap_avframe(placeboGpu(), &direct_frame);
++    }
++    direct_frame = {};
++}
++
++bool QmlMainWindow::mapDirectFrame(AVFrame *incoming)
++{
++    AVFrame *software = nullptr;
++#ifdef Q_OS_MACOS
++    const bool hardware = incoming->format == AV_PIX_FMT_VIDEOTOOLBOX;
++    static const bool measure = qEnvironmentVariableIntValue("CHIAKI_MEASURE_FRAME_PREPARE") == 1;
++    const auto begin = measure ? chiaki_time_now_monotonic_us() : 0;
++    if (hardware) {
++        if (!mac_video_import_failed) {
++            if (!mac_video_frames)
++                mac_video_frames = createMacVideoFrames(placebo_vulkan);
++            if (importMacVideoFrame(mac_video_frames, incoming, &direct_frame)) {
++                static const bool logged = [] {
++                    qCInfo(chiakiGui) << "Presenting VideoToolbox surfaces through Metal texture import";
++                    return true;
++                }();
++                Q_UNUSED(logged);
++                mac_video_frame_active = true;
++                if (measure)
++                    qCInfo(chiakiGui).nospace() << "[direct-map] us=" << chiaki_time_now_monotonic_us() - begin << " metal=1";
++                return true;
++            }
++            mac_video_import_failed = true;
++            qCWarning(chiakiGui) << "VideoToolbox Metal import unavailable, using software upload";
++        }
++
++        software = av_frame_alloc();
++        if (!software || av_hwframe_transfer_data(software, incoming, 0) < 0 ||
++            av_frame_copy_props(software, incoming) < 0) {
++            av_frame_free(&software);
++            return false;
++        }
++    }
++#endif
++    pl_avframe_params avparams{};
++    avparams.frame = software ? software : incoming;
++    avparams.tex = placebo_tex.data();
++    const bool mapped = pl_map_avframe_ex(placeboGpu(), &direct_frame, &avparams);
++    av_frame_free(&software);
++#ifdef Q_OS_MACOS
++    if (measure)
++        qCInfo(chiakiGui).nospace() << "[direct-map] us=" << chiaki_time_now_monotonic_us() - begin << " metal=0";
++#endif
++    return mapped;
++}
++
+ class RenderControl : public QQuickRenderControl
+ {
+ public:
+@@ -2619,7 +2680,12 @@ QmlMainWindow::~QmlMainWindow()
+ #endif
+ 
+     if (pl_gpu gpu = placeboGpu()) {
+-        pl_unmap_avframe(gpu, &direct_frame);
++        clearDirectFrame();
++#ifdef Q_OS_MACOS
++        destroyMacVideoFrames(mac_video_frames);
++        mac_video_frames = nullptr;
++        mac_video_import_failed = false;
++#endif
+         if (quick_tex)
+             pl_tex_destroy(gpu, &quick_tex);
+         for (auto &tex : placebo_tex)
+@@ -3651,7 +3717,8 @@ bool QmlMainWindow::storePendingFrame(ChiakiFfmpegFrame &frame, bool take_owners
+ 
+     double queue_origin = queuePtsOriginCached();
+     queue_depth = queue_depth_cached.loadAcquire();
+-    const bool have_state_lock = placebo_state_mutex.tryLock();
++    std::unique_lock<QMutex> state_lock(placebo_state_mutex, std::try_to_lock);
++    const bool have_state_lock = state_lock.owns_lock();
+     if (have_state_lock) {
+         queue_origin = queue_pts_origin;
+         queue_depth = pl_queue_num_frames(placebo_queue);
+@@ -3755,7 +3822,7 @@ bool QmlMainWindow::storePendingFrame(ChiakiFfmpegFrame &frame, bool take_owners
+             startup_first_real_frame_queued_pending_visibility.storeRelease(1);
+ 
+     if (have_state_lock)
+-        placebo_state_mutex.unlock();
++        state_lock.unlock();
+ 
+     if (take_ownership)
+         frame.frame = nullptr;
+@@ -6790,20 +6857,19 @@ void QmlMainWindow::render()
+             std::swap(incoming, direct_pending_frame);
+             reset_direct_frame = direct_frame_reset.fetchAndStoreRelaxed(0) != 0;
+         }
++        if (reset_direct_frame || incoming)
++            clearDirectFrame();
++#ifdef Q_OS_MACOS
+         if (reset_direct_frame) {
+-            pl_unmap_avframe(placeboGpu(), &direct_frame);
+-            direct_frame = {};
++            destroyMacVideoFrames(mac_video_frames);
++            mac_video_frames = nullptr;
++            mac_video_import_failed = false;
+         }
++#endif
+         if (incoming) {
+-            pl_unmap_avframe(placeboGpu(), &direct_frame);
+-            direct_frame = {};
+-            pl_avframe_params avparams = {};
+-            avparams.frame = incoming;
+-            avparams.tex = placebo_tex.data();
+-            if (!pl_map_avframe_ex(placeboGpu(), &direct_frame, &avparams)) {
++            if (!mapDirectFrame(incoming)) {
+                 qCWarning(chiakiGui) << "Failed to map direct video frame";
+-                pl_unmap_avframe(placeboGpu(), &direct_frame);
+-                direct_frame = {};
++                clearDirectFrame();
+                 if (backend && backend->zeroCopy())
+                     backend->disableZeroCopy();
+             }
+diff --git a/lib/src/audioreceiver.c b/lib/src/audioreceiver.c
+index af91910..f12a18d 100644
+--- a/lib/src/audioreceiver.c
++++ b/lib/src/audioreceiver.c
+@@ -120,18 +120,26 @@ CHIAKI_EXPORT void chiaki_audio_receiver_av_packet(ChiakiAudioReceiver *audio_re
+ 
+ 	for(size_t i = 0; i < source_units_count + fec_units_count; i++)
+ 	{
++		// Audio units must reach the jitter buffer in chronological order. In the
++		// packet, new source units precede redundant copies of older frames. If a
++		// source unit is delivered first, it can trigger loss concealment for a
++		// missing frame whose real audio is still present later in this packet.
++		// Haptics deliberately keep source-first delivery to avoid replaying stale
++		// effects, since their sink does not use the audio jitter buffer.
++		size_t unit_index = packet->is_haptics ? i
++			: (i < fec_units_count ? source_units_count + i : i - fec_units_count);
+ 		ChiakiSeqNum16 frame_index;
+-		if(i < source_units_count)
+-			frame_index = packet->frame_index + i;
++		if(unit_index < source_units_count)
++			frame_index = packet->frame_index + unit_index;
+ 		else
+ 		{
+-			size_t fec_index = i - source_units_count;
++			size_t fec_index = unit_index - source_units_count;
+ 			if(audio_receiver->frame_index_startup && packet->frame_index + fec_index < fec_units_count + 1)
+ 				continue;
+ 			frame_index = packet->frame_index - fec_units_count + fec_index;
+ 		}
+ 
+-		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->is_haptics, packet->data + unit_size * i, unit_size);
++		chiaki_audio_receiver_frame(audio_receiver, frame_index, packet->is_haptics, packet->data + unit_size * unit_index, unit_size);
+ 	}
+ 
+ 	if(audio_receiver->packet_stats)
+diff --git a/lib/src/packetstats.c b/lib/src/packetstats.c
+index 58ef4c6..c98a4ed 100644
+--- a/lib/src/packetstats.c
++++ b/lib/src/packetstats.c
+@@ -50,9 +50,11 @@ CHIAKI_EXPORT void chiaki_packet_stats_push_generation(ChiakiPacketStats *stats,
+ 
+ CHIAKI_EXPORT void chiaki_packet_stats_push_seq(ChiakiPacketStats *stats, ChiakiSeqNum16 seq_num)
+ {
++	chiaki_mutex_lock(&stats->mutex);
+ 	stats->seq_received++;
+ 	if(chiaki_seq_num_16_gt(seq_num, stats->seq_max))
+ 		stats->seq_max = seq_num;
++	chiaki_mutex_unlock(&stats->mutex);
+ }
+ 
+ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset, uint64_t *received, uint64_t *lost)
+@@ -68,8 +70,12 @@ CHIAKI_EXPORT void chiaki_packet_stats_get(ChiakiPacketStats *stats, bool reset,
+ 	//		(unsigned long long)stats->gen_lost);
+ 
+ 	// seq
+-	uint64_t seq_diff = stats->seq_max - stats->seq_min; // overflow on purpose if max < min
+-	uint64_t seq_lost = stats->seq_received > seq_diff ? seq_diff : seq_diff - stats->seq_received;
++	// Subtraction is promoted to int; narrow back to the sequence number width
++	// before widening so a 65535 -> 0 wrap produces a small positive span.
++	uint64_t seq_diff = (ChiakiSeqNum16)(stats->seq_max - stats->seq_min);
++	// Duplicate/late packets can make the received count exceed this span.
++	// They must not turn an otherwise lossless interval into reported loss.
++	uint64_t seq_lost = stats->seq_received > seq_diff ? 0 : seq_diff - stats->seq_received;
+ 	*received += stats->seq_received;
+ 	*lost += seq_lost;
+ 
+diff --git a/scripts/benchmark-videotoolbox.c b/scripts/benchmark-videotoolbox.c
+new file mode 100644
+index 0000000..6a865a4
+--- /dev/null
++++ b/scripts/benchmark-videotoolbox.c
+@@ -0,0 +1,214 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++// Scratch benchmark, not a player or end-to-end Remote Play latency test.
++/* macOS with Homebrew FFmpeg:
++ * clang -std=c11 -O2 -Wall -Wextra -Werror \
++ *   -I/opt/homebrew/opt/ffmpeg/include scripts/benchmark-videotoolbox.c \
++ *   -L/opt/homebrew/opt/ffmpeg/lib -lavutil -o /tmp/chiaki-vt-benchmark
++ * /tmp/chiaki-vt-benchmark
++ */
++
++#define _POSIX_C_SOURCE 200809L
++#include <libavutil/avutil.h>
++#include <libavutil/error.h>
++#include <libavutil/frame.h>
++#include <libavutil/hwcontext.h>
++#include <libavutil/pixdesc.h>
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++enum { WIDTH = 1920, HEIGHT = 1080, POOL = 8, WARMUP = 50, SAMPLES = 400 };
++
++static int64_t now_ns(void)
++{
++    struct timespec value;
++    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) {
++        perror("clock_gettime");
++        exit(1);
++    }
++    return (int64_t)value.tv_sec * INT64_C(1000000000) + value.tv_nsec;
++}
++
++static void checked(int result, const char *operation)
++{
++    if (result >= 0)
++        return;
++    char error[AV_ERROR_MAX_STRING_SIZE];
++    av_strerror(result, error, sizeof(error));
++    fprintf(stderr, "%s: %s\n", operation, error);
++    exit(1);
++}
++
++static AVFrame *alloc_frame(void)
++{
++    AVFrame *frame = av_frame_alloc();
++    if (!frame) {
++        fprintf(stderr, "av_frame_alloc failed\n");
++        exit(1);
++    }
++    return frame;
++}
++
++static int row_bytes(enum AVPixelFormat format)
++{
++    return WIDTH * (format == AV_PIX_FMT_P010LE ? 2 : 1);
++}
++
++static void fill_frame(AVFrame *hardware, enum AVPixelFormat format, int id)
++{
++    AVFrame *mapped = alloc_frame();
++    checked(av_hwframe_map(mapped, hardware, AV_HWFRAME_MAP_WRITE | AV_HWFRAME_MAP_OVERWRITE), "write map");
++    for (int plane = 0; plane < 2; ++plane) {
++        const int rows = plane ? HEIGHT / 2 : HEIGHT;
++        if (!mapped->data[plane] || mapped->linesize[plane] < row_bytes(format)) {
++            fprintf(stderr, "Invalid writable VideoToolbox plane or stride\n");
++            av_frame_free(&mapped);
++            exit(1);
++        }
++        for (int row = 0; row < rows; ++row)
++            memset(mapped->data[plane] + (size_t)row * mapped->linesize[plane],
++                   (plane ? 0x80 : 0x20) + id, (size_t)row_bytes(format));
++    }
++    av_frame_free(&mapped);
++}
++
++static void verify_frame(const AVFrame *frame, enum AVPixelFormat format, int id)
++{
++    if (frame->format != format || frame->width != WIDTH || frame->height != HEIGHT) {
++        fprintf(stderr, "Incorrect mapped/copied format or dimensions\n");
++        exit(1);
++    }
++    for (int plane = 0; plane < 2; ++plane) {
++        const int rows = plane ? HEIGHT / 2 : HEIGHT;
++        const int bytes = row_bytes(format);
++        const uint8_t expected = (uint8_t)((plane ? 0x80 : 0x20) + id);
++        if (!frame->data[plane] || frame->linesize[plane] < bytes) {
++            fprintf(stderr, "Missing plane or invalid stride\n");
++            exit(1);
++        }
++        for (int row = 0; row < rows; row += rows - 1) {
++            const uint8_t *data = frame->data[plane] + (size_t)row * frame->linesize[plane];
++            if (data[0] != expected || data[bytes / 2] != expected || data[bytes - 1] != expected) {
++                fprintf(stderr, "Copied/mapped pixel validation failed\n");
++                exit(1);
++            }
++        }
++    }
++}
++
++static void check_retained_mapping(AVBufferRef *frames, enum AVPixelFormat format)
++{
++    AVFrame *source = alloc_frame();
++    checked(av_hwframe_get_buffer(frames, source, 0), "allocate lifetime-check frame");
++    fill_frame(source, format, 17);
++    AVFrame *mapped = alloc_frame();
++    checked(av_hwframe_map(mapped, source, AV_HWFRAME_MAP_READ), "lifetime-check map");
++    av_frame_free(&source);
++    AVFrame *retained = av_frame_clone(mapped);
++    if (!retained) {
++        fprintf(stderr, "clone mapped frame failed\n");
++        exit(1);
++    }
++    av_frame_free(&mapped);
++    verify_frame(retained, format, 17);
++    av_frame_free(&retained);
++}
++
++static int compare_ns(const void *left, const void *right)
++{
++    const int64_t a = *(const int64_t *)left;
++    const int64_t b = *(const int64_t *)right;
++    return (a > b) - (a < b);
++}
++
++static void print_distribution(int64_t *values)
++{
++    qsort(values, SAMPLES, sizeof(*values), compare_ns);
++    printf("{\"p50_us\":%.3f,\"p95_us\":%.3f,\"p99_us\":%.3f,\"max_us\":%.3f}",
++           values[SAMPLES / 2 - 1] / 1000.0, values[SAMPLES * 95 / 100 - 1] / 1000.0,
++           values[SAMPLES * 99 / 100 - 1] / 1000.0, values[SAMPLES - 1] / 1000.0);
++}
++
++static void benchmark_format(AVBufferRef *device, enum AVPixelFormat format)
++{
++    AVBufferRef *frames = av_hwframe_ctx_alloc(device);
++    if (!frames) {
++        fprintf(stderr, "av_hwframe_ctx_alloc failed\n");
++        exit(1);
++    }
++    AVHWFramesContext *context = (AVHWFramesContext *)frames->data;
++    context->format = AV_PIX_FMT_VIDEOTOOLBOX;
++    context->sw_format = format;
++    context->width = WIDTH;
++    context->height = HEIGHT;
++    context->initial_pool_size = POOL;
++    checked(av_hwframe_ctx_init(frames), "VideoToolbox frames context");
++
++    AVFrame *source[POOL];
++    for (int i = 0; i < POOL; ++i) {
++        source[i] = alloc_frame();
++        checked(av_hwframe_get_buffer(frames, source[i], 0), "allocate VideoToolbox frame");
++        fill_frame(source[i], format, i);
++    }
++    check_retained_mapping(frames, format);
++
++    int64_t setup[2][SAMPLES];
++    int64_t setup_and_release[2][SAMPLES];
++    for (int iteration = 0; iteration < WARMUP + SAMPLES; ++iteration) {
++        const int id = iteration % POOL;
++        // Alternate order in each pair; neither path always receives a warmer buffer.
++        for (int step = 0; step < 2; ++step) {
++            const int mapping = (iteration + step) % 2;
++            const int64_t begin = now_ns();
++            AVFrame *output = alloc_frame();
++            if (mapping) {
++                checked(av_hwframe_map(output, source[id], AV_HWFRAME_MAP_READ), "read-only map");
++            } else {
++                checked(av_hwframe_transfer_data(output, source[id], 0), "hardware-to-software copy");
++                checked(av_frame_copy_props(output, source[id]), "copy frame properties");
++            }
++            const int64_t prepared = now_ns();
++            // Verify without counting sampling/validation overhead as preparation cost.
++            verify_frame(output, format, id);
++            const int64_t release_begin = now_ns();
++            av_frame_free(&output);
++            const int64_t released = now_ns();
++            if (iteration >= WARMUP) {
++                const int sample = iteration - WARMUP;
++                setup[mapping][sample] = prepared - begin;
++                setup_and_release[mapping][sample] = prepared - begin + released - release_begin;
++            }
++        }
++    }
++    printf("{\"format\":\"%s\",\"width\":%d,\"height\":%d,\"pool_frames\":%d,"
++           "\"warmup_pairs\":%d,\"measured_pairs\":%d,\"retained_mapping_verified\":true,",
++           av_get_pix_fmt_name(format), WIDTH, HEIGHT, POOL, WARMUP, SAMPLES);
++    for (int mapping = 0; mapping < 2; ++mapping) {
++        printf("\"%s\":{\"prepare\":", mapping ? "readonly_map" : "copy");
++        print_distribution(setup[mapping]);
++        printf(",\"prepare_plus_release\":");
++        print_distribution(setup_and_release[mapping]);
++        printf("}%s", mapping ? "" : ",");
++    }
++    printf("}");
++    for (int i = 0; i < POOL; ++i)
++        av_frame_free(&source[i]);
++    av_buffer_unref(&frames);
++}
++
++int main(void)
++{
++    AVBufferRef *device = NULL;
++    checked(av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_VIDEOTOOLBOX, NULL, NULL, 0), "VideoToolbox device");
++    printf("{\"benchmark\":\"CPU preparation of allocated VideoToolbox frames; excludes decode, GPU upload, presentation and network\","
++           "\"ffmpeg_version\":\"%s\",\"libavutil_version\":%u,\"formats\":[", av_version_info(), avutil_version());
++    benchmark_format(device, AV_PIX_FMT_NV12);
++    printf(",");
++    benchmark_format(device, AV_PIX_FMT_P010LE);
++    printf("]}\n");
++    av_buffer_unref(&device);
++    return 0;
++}
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index f30d758..c0c3511 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -17,6 +17,8 @@ set(CHIAKI_UNIT_SOURCES
+ 				seqnum.c
+ 				keystate.c
+ 				feedback.c
++				audioreceiver.c
++				packetstats.c
+ 				reorderqueue.c
+ 				fec.c
+ 				test_log.c
+@@ -39,4 +41,9 @@ target_link_libraries(chiaki-unit chiaki-lib munit)
+ 
+ if(CHIAKI_ENABLE_FFMPEG_DECODER)
+ 	target_link_libraries(chiaki-unit FFMPEG::avcodec FFMPEG::avutil)
++
++	add_executable(chiaki-video-mailbox videoframemailbox.cpp)
++	target_include_directories(chiaki-video-mailbox PRIVATE "${PROJECT_SOURCE_DIR}/gui/include")
++	target_link_libraries(chiaki-video-mailbox chiaki-lib FFMPEG::avcodec FFMPEG::avutil)
++	add_test(NAME video-mailbox COMMAND chiaki-video-mailbox)
+ endif()
+diff --git a/test/audioreceiver.c b/test/audioreceiver.c
+new file mode 100644
+index 0000000..f3cbea5
+--- /dev/null
++++ b/test/audioreceiver.c
+@@ -0,0 +1,220 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++#include <munit.h>
++
++#include <string.h>
++
++#include <chiaki/audioreceiver.h>
++#include <chiaki/session.h>
++
++#include "test_log.h"
++
++#define CAPTURED_FRAMES_MAX 64
++#define CONCEALED_FRAME (-1)
++
++typedef struct captured_frames_t
++{
++	int frames[CAPTURED_FRAMES_MAX];
++	size_t count;
++} CapturedFrames;
++
++typedef struct audio_receiver_fixture_t
++{
++	ChiakiSession session;
++	ChiakiAudioReceiver receiver;
++	CapturedFrames audio;
++	CapturedFrames haptics;
++} AudioReceiverFixture;
++
++static void capture_frame(uint8_t *buf, size_t buf_size, void *user)
++{
++	CapturedFrames *captured = user;
++	munit_assert_size(captured->count, <, CAPTURED_FRAMES_MAX);
++	if(!buf)
++	{
++		munit_assert_size(buf_size, ==, 0);
++		captured->frames[captured->count++] = CONCEALED_FRAME;
++	}
++	else
++	{
++		munit_assert_size(buf_size, ==, 2);
++		captured->frames[captured->count++] = ((int)buf[0] << 8) | buf[1];
++	}
++}
++
++static void *fixture_setup(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = munit_malloc(sizeof(*fixture));
++	memset(fixture, 0, sizeof(*fixture));
++	fixture->session.log = get_test_log();
++	fixture->session.audio_sink.frame_cb = capture_frame;
++	fixture->session.audio_sink.user = &fixture->audio;
++	fixture->session.haptics_sink.frame_cb = capture_frame;
++	fixture->session.haptics_sink.user = &fixture->haptics;
++	munit_assert_int(chiaki_audio_receiver_init(&fixture->receiver, &fixture->session, NULL), ==, CHIAKI_ERR_SUCCESS);
++	return fixture;
++}
++
++static void fixture_teardown(void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	chiaki_audio_receiver_fini(&fixture->receiver);
++	free(fixture);
++}
++
++// The transport puts current source units first and copies of earlier frames afterwards.
++// Each synthetic encoded unit identifies its frame so the callback can check chronology
++// without involving an Opus decoder or an audio device.
++static void send_packet(AudioReceiverFixture *fixture, ChiakiSeqNum16 first_source,
++		uint8_t source_count, uint8_t fec_count, bool is_haptics)
++{
++	uint8_t data[2 * (15 + 15)];
++	munit_assert_uint8(source_count, <=, 15);
++	munit_assert_uint8(fec_count, <=, 15);
++	for(size_t i = 0; i < source_count + fec_count; i++)
++	{
++		ChiakiSeqNum16 frame = i < source_count ? first_source + i
++			: first_source - fec_count + (i - source_count);
++		data[2 * i] = (uint8_t)(frame >> 8);
++		data[2 * i + 1] = (uint8_t)frame;
++	}
++	ChiakiTakionAVPacket packet = { 0 };
++	packet.codec = 5;
++	packet.frame_index = first_source;
++	packet.is_haptics = is_haptics;
++	packet.units_in_frame_total = source_count + fec_count;
++	packet.units_in_frame_fec = (2 << 8) | (fec_count << 4) | source_count;
++	packet.data = data;
++	packet.data_size = 2 * packet.units_in_frame_total;
++	chiaki_audio_receiver_av_packet(&fixture->receiver, &packet);
++}
++
++static void prime_audio(AudioReceiverFixture *fixture, ChiakiSeqNum16 first)
++{
++	for(unsigned int i = 0; i < 3; i++)
++		send_packet(fixture, first + i, 1, 0, false);
++	munit_assert_size(fixture->audio.count, ==, 3);
++}
++
++static void assert_contiguous_audio(AudioReceiverFixture *fixture, ChiakiSeqNum16 first, size_t count)
++{
++	munit_assert_size(fixture->audio.count, ==, count);
++	for(size_t i = 0; i < count; i++)
++		munit_assert_int(fixture->audio.frames[i], ==, (ChiakiSeqNum16)(first + i));
++	munit_assert_size(fixture->haptics.count, ==, 0);
++}
++
++static MunitResult test_source_only(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	send_packet(fixture, 1, 1, 0, false);
++	send_packet(fixture, 2, 1, 0, false);
++	munit_assert_size(fixture->audio.count, ==, 0);
++	send_packet(fixture, 3, 1, 0, false);
++	assert_contiguous_audio(fixture, 1, 3);
++	send_packet(fixture, 4, 1, 0, false);
++	assert_contiguous_audio(fixture, 1, 4);
++	return MUNIT_OK;
++}
++
++static MunitResult test_recover_before_concealing(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	prime_audio(fixture, 1);
++	// Packet 4 was lost, but its complete encoded audio is already in packet 5.
++	send_packet(fixture, 5, 1, 2, false);
++	assert_contiguous_audio(fixture, 1, 5);
++	return MUNIT_OK;
++}
++
++static MunitResult test_multiple_source_and_redundant_units(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	prime_audio(fixture, 10);
++	// Recover 13 and 14 before delivering both new source frames, 15 and 16.
++	send_packet(fixture, 15, 2, 2, false);
++	assert_contiguous_audio(fixture, 10, 7);
++	return MUNIT_OK;
++}
++
++static MunitResult test_duplicate_and_late_packets(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	prime_audio(fixture, 1);
++	send_packet(fixture, 4, 1, 2, false);
++	send_packet(fixture, 4, 1, 2, false);
++	send_packet(fixture, 2, 1, 0, false);
++	send_packet(fixture, 5, 1, 2, false);
++	assert_contiguous_audio(fixture, 1, 5);
++	return MUNIT_OK;
++}
++
++static MunitResult test_conceal_only_unrecoverable_gap(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	prime_audio(fixture, 1);
++	// Packet 6 can recover frame 5, but frame 4 is genuinely unavailable.
++	send_packet(fixture, 6, 1, 1, false);
++	munit_assert_size(fixture->audio.count, ==, 6);
++	munit_assert_int(fixture->audio.frames[3], ==, CONCEALED_FRAME);
++	munit_assert_int(fixture->audio.frames[4], ==, 5);
++	munit_assert_int(fixture->audio.frames[5], ==, 6);
++	return MUNIT_OK;
++}
++
++static MunitResult test_recovery_across_sequence_wrap(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	prime_audio(fixture, 65532);
++	// The two redundant frames are 65535 and 0, followed by new frame 1.
++	send_packet(fixture, 1, 1, 2, false);
++	assert_contiguous_audio(fixture, 65532, 6);
++	return MUNIT_OK;
++}
++
++static MunitResult test_startup_ignores_nonexistent_redundancy(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	for(unsigned int i = 1; i <= 3; i++)
++		send_packet(fixture, i, 1, 3, false);
++	assert_contiguous_audio(fixture, 1, 3);
++	return MUNIT_OK;
++}
++
++static MunitResult test_reordered_startup(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	send_packet(fixture, 3, 1, 0, false);
++	send_packet(fixture, 1, 1, 0, false);
++	munit_assert_size(fixture->audio.count, ==, 0);
++	send_packet(fixture, 2, 1, 0, false);
++	assert_contiguous_audio(fixture, 1, 3);
++	return MUNIT_OK;
++}
++
++static MunitResult test_haptics_remain_source_first(const MunitParameter params[], void *user)
++{
++	AudioReceiverFixture *fixture = user;
++	send_packet(fixture, 3, 1, 2, true);
++	send_packet(fixture, 4, 1, 2, true);
++	munit_assert_size(fixture->haptics.count, ==, 2);
++	munit_assert_int(fixture->haptics.frames[0], ==, 3);
++	munit_assert_int(fixture->haptics.frames[1], ==, 4);
++	munit_assert_size(fixture->audio.count, ==, 0);
++	return MUNIT_OK;
++}
++
++#define AUDIO_TEST(name) { "/" #name, test_##name, fixture_setup, fixture_teardown, MUNIT_TEST_OPTION_NONE, NULL }
++
++MunitTest tests_audioreceiver[] = {
++	AUDIO_TEST(source_only),
++	AUDIO_TEST(recover_before_concealing),
++	AUDIO_TEST(multiple_source_and_redundant_units),
++	AUDIO_TEST(duplicate_and_late_packets),
++	AUDIO_TEST(conceal_only_unrecoverable_gap),
++	AUDIO_TEST(recovery_across_sequence_wrap),
++	AUDIO_TEST(startup_ignores_nonexistent_redundancy),
++	AUDIO_TEST(reordered_startup),
++	AUDIO_TEST(haptics_remain_source_first),
++	{ NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL }
++};
+diff --git a/test/main.c b/test/main.c
+index 1f926d7..0b8c993 100644
+--- a/test/main.c
++++ b/test/main.c
+@@ -6,6 +6,8 @@
+ extern MunitTest tests_seq_num[];
+ extern MunitTest tests_key_state[];
+ extern MunitTest tests_feedback[];
++extern MunitTest tests_audioreceiver[];
++extern MunitTest tests_packetstats[];
+ extern MunitTest tests_reorder_queue[];
+ extern MunitTest tests_http[];
+ extern MunitTest tests_rpcrypt[];
+@@ -22,6 +24,20 @@ extern MunitTest tests_ffmpegdecoder[];
+ #endif
+ 
+ static MunitSuite suites[] = {
++	{
++		"/packetstats",
++		tests_packetstats,
++		NULL,
++		1,
++		MUNIT_SUITE_OPTION_NONE
++	},
++	{
++		"/audioreceiver",
++		tests_audioreceiver,
++		NULL,
++		1,
++		MUNIT_SUITE_OPTION_NONE
++	},
+ 	{
+ 		"/seq_num",
+ 		tests_seq_num,
+diff --git a/test/packetstats.c b/test/packetstats.c
+new file mode 100644
+index 0000000..67a4367
+--- /dev/null
++++ b/test/packetstats.c
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++#include <munit.h>
++#include <chiaki/packetstats.h>
++
++static void expect_stats(ChiakiPacketStats *stats, bool reset, uint64_t expected_received, uint64_t expected_lost)
++{
++	uint64_t received, lost;
++	chiaki_packet_stats_get(stats, reset, &received, &lost);
++	munit_assert_uint64(received, ==, expected_received);
++	munit_assert_uint64(lost, ==, expected_lost);
++}
++
++static void start_before_wrap(ChiakiPacketStats *stats)
++{
++	munit_assert_int(chiaki_packet_stats_init(stats), ==, CHIAKI_ERR_SUCCESS);
++	for(uint32_t seq = 1; seq <= 65534; seq++)
++		chiaki_packet_stats_push_seq(stats, (ChiakiSeqNum16)seq);
++	expect_stats(stats, true, 65534, 0);
++}
++
++static MunitResult test_empty_and_generation(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	munit_assert_int(chiaki_packet_stats_init(&stats), ==, CHIAKI_ERR_SUCCESS);
++	expect_stats(&stats, false, 0, 0);
++	chiaki_packet_stats_push_generation(&stats, 70, 3);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	chiaki_packet_stats_push_seq(&stats, 3);
++	expect_stats(&stats, false, 72, 4);
++	expect_stats(&stats, true, 72, 4);
++	expect_stats(&stats, false, 0, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_reordered_packets(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	munit_assert_int(chiaki_packet_stats_init(&stats), ==, CHIAKI_ERR_SUCCESS);
++	chiaki_packet_stats_push_seq(&stats, 3);
++	expect_stats(&stats, false, 1, 2);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	expect_stats(&stats, true, 3, 0);
++	chiaki_packet_stats_push_seq(&stats, 4);
++	expect_stats(&stats, true, 1, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_duplicates_do_not_invent_loss(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	munit_assert_int(chiaki_packet_stats_init(&stats), ==, CHIAKI_ERR_SUCCESS);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	expect_stats(&stats, true, 3, 0);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	expect_stats(&stats, true, 1, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_sequence_wrap_without_loss(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	start_before_wrap(&stats);
++	chiaki_packet_stats_push_seq(&stats, 65535);
++	chiaki_packet_stats_push_seq(&stats, 0);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	expect_stats(&stats, true, 3, 0);
++	chiaki_packet_stats_push_seq(&stats, 2);
++	expect_stats(&stats, true, 1, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_sequence_wrap_with_loss(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	start_before_wrap(&stats);
++	/* 65535 was lost; 0 and 1 arrived. */
++	chiaki_packet_stats_push_seq(&stats, 0);
++	chiaki_packet_stats_push_seq(&stats, 1);
++	expect_stats(&stats, true, 2, 1);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++static MunitResult test_long_stream_with_periodic_reporting(const MunitParameter params[], void *user)
++{
++	ChiakiPacketStats stats;
++	munit_assert_int(chiaki_packet_stats_init(&stats), ==, CHIAKI_ERR_SUCCESS);
++	uint64_t pending = 0;
++	for(uint32_t seq = 1; seq <= 200000; seq++)
++	{
++		chiaki_packet_stats_push_seq(&stats, (ChiakiSeqNum16)seq);
++		pending++;
++		if(seq % 17 == 0)
++		{
++			expect_stats(&stats, true, pending, 0);
++			pending = 0;
++		}
++	}
++	expect_stats(&stats, true, pending, 0);
++	chiaki_packet_stats_fini(&stats);
++	return MUNIT_OK;
++}
++
++MunitTest tests_packetstats[] = {
++	{ "/empty_and_generation", test_empty_and_generation, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/reordered_packets", test_reordered_packets, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/duplicates_do_not_invent_loss", test_duplicates_do_not_invent_loss, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/sequence_wrap_without_loss", test_sequence_wrap_without_loss, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/sequence_wrap_with_loss", test_sequence_wrap_with_loss, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ "/long_stream_with_periodic_reporting", test_long_stream_with_periodic_reporting, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL },
++	{ NULL, NULL, NULL, NULL, MUNIT_TEST_OPTION_NONE, NULL }
++};
+diff --git a/test/videoframemailbox.cpp b/test/videoframemailbox.cpp
+new file mode 100644
+index 0000000..47c1118
+--- /dev/null
++++ b/test/videoframemailbox.cpp
+@@ -0,0 +1,247 @@
++// SPDX-License-Identifier: LicenseRef-AGPL-3.0-only-OpenSSL
++
++#include "videoframemailbox.h"
++
++extern "C" {
++#include <libavutil/buffer.h>
++#include <libavutil/mem.h>
++}
++
++#include <atomic>
++#include <condition_variable>
++#include <functional>
++#include <iostream>
++#include <memory>
++#include <stdexcept>
++#include <string>
++#include <thread>
++
++static void require(bool condition, const char *expression, int line)
++{
++    if (!condition)
++        throw std::runtime_error(std::string(expression) + " at line " + std::to_string(line));
++}
++#define CHECK(condition) require(condition, #condition, __LINE__)
++
++static void release_buffer(void *opaque, uint8_t *data)
++{
++    auto *released = static_cast<std::atomic<int> *>(opaque);
++    released->fetch_add(1);
++    av_free(data);
++}
++
++static VideoFrameMailbox::Frame make_frame(std::atomic<int> &released, int id,
++                                          int32_t lost = 0, bool recovered = false)
++{
++    ChiakiFfmpegFrame value = {};
++    value.frame = av_frame_alloc();
++    CHECK(value.frame != nullptr);
++    uint8_t *data = static_cast<uint8_t *>(av_malloc(1));
++    if (!data) {
++        av_frame_free(&value.frame);
++        throw std::runtime_error("av_malloc failed");
++    }
++    value.frame->buf[0] = av_buffer_create(data, 1, release_buffer, &released, 0);
++    if (!value.frame->buf[0]) {
++        av_free(data);
++        av_frame_free(&value.frame);
++        throw std::runtime_error("av_buffer_create failed");
++    }
++    value.frame->data[0] = data;
++    value.frame->pts = id;
++    value.pts = id;
++    value.duration = 1.0 / 60.0;
++    value.recovered = recovered;
++    return VideoFrameMailbox::Frame(value, lost, id * INT64_C(1000));
++}
++
++static void test_stalled_consumer_gets_newest()
++{
++    std::atomic<int> released{0};
++    VideoFrameMailbox mailbox;
++    CHECK(!mailbox.take().frame.frame);
++    int notifications = 0;
++    const int count = 600;
++    for (int i = 1; i <= count; ++i)
++        notifications += mailbox.push(make_frame(released, i, 0, i == 1));
++    CHECK(notifications == 1);
++    CHECK(released == count - 1);
++    auto delivery = mailbox.take();
++    CHECK(delivery.frame.frame->pts == count);
++    CHECK(delivery.frames_lost == count - 1);
++    CHECK(delivery.frame.recovered);
++    CHECK(delivery.delivery_us == count * INT64_C(1000));
++    CHECK(!mailbox.take().frame.frame);
++    ChiakiFfmpegFrame renderer_owned = delivery.release();
++    CHECK(!delivery.frame.frame);
++    CHECK(released == count - 1);
++    av_frame_free(&renderer_owned.frame);
++    CHECK(released == count);
++    CHECK(mailbox.push(make_frame(released, count + 1)));
++    mailbox.cancel();
++    CHECK(released == count + 1);
++}
++
++static void test_loss_and_recovery_metadata()
++{
++    std::atomic<int> released{0};
++    VideoFrameMailbox mailbox;
++    CHECK(mailbox.push(make_frame(released, 1, 2, true)));
++    CHECK(!mailbox.push(make_frame(released, 2, 3)));
++    auto delivery = mailbox.take();
++    CHECK(delivery.frames_lost == 6); // 2 upstream + 3 upstream + 1 replaced
++    CHECK(delivery.frame.recovered);
++    CHECK(delivery.frame.duration == 1.0 / 60.0);
++    CHECK(mailbox.push(make_frame(released, 3)));
++    auto next = mailbox.take();
++    CHECK(next.frames_lost == 0);
++    CHECK(!next.frame.recovered);
++
++    CHECK(mailbox.push(make_frame(released, 4, std::numeric_limits<int32_t>::max())));
++    CHECK(!mailbox.push(make_frame(released, 5, 1)));
++    CHECK(mailbox.take().frames_lost == std::numeric_limits<int32_t>::max());
++    delivery = VideoFrameMailbox::Frame();
++    next = VideoFrameMailbox::Frame();
++    CHECK(released == 5);
++}
++
++static void test_cancel_and_session_replacement()
++{
++    std::atomic<int> released{0};
++    auto old_session = std::make_shared<VideoFrameMailbox>();
++    CHECK(old_session->push(make_frame(released, 1)));
++    std::function<void()> queued_callback = [old_session]() {
++        CHECK(!old_session->take().frame.frame);
++    };
++    old_session->cancel();
++    CHECK(released == 1);
++    CHECK(!old_session->push(make_frame(released, 2)));
++    CHECK(released == 2);
++    old_session.reset();
++
++    auto new_session = std::make_shared<VideoFrameMailbox>();
++    CHECK(new_session->push(make_frame(released, 3)));
++    queued_callback();
++    CHECK(new_session->take().frame.frame->pts == 3);
++    CHECK(released == 3);
++
++    CHECK(new_session->push(make_frame(released, 4)));
++    new_session.reset(); // Context/callback destruction must also release pending frames.
++    CHECK(released == 4);
++}
++
++static void test_producer_consumer_race()
++{
++    const int count = 20000;
++    std::atomic<int> released{0};
++    VideoFrameMailbox mailbox;
++    std::mutex event_mutex;
++    std::condition_variable wake;
++    int queued_callbacks = 0;
++    int peak_callbacks = 0;
++    bool done = false;
++    int accounted_frames = 0;
++    int last_id = 0;
++    bool monotonic = true;
++    std::thread producer([&]() {
++        for (int id = 1; id <= count; ++id) {
++            if (mailbox.push(make_frame(released, id))) {
++                std::lock_guard<std::mutex> lock(event_mutex);
++                ++queued_callbacks;
++                peak_callbacks = std::max(peak_callbacks, queued_callbacks);
++                wake.notify_one();
++            }
++        }
++        std::lock_guard<std::mutex> lock(event_mutex);
++        done = true;
++        wake.notify_one();
++    });
++    for (;;) {
++        {
++            std::unique_lock<std::mutex> lock(event_mutex);
++            wake.wait(lock, [&]() { return queued_callbacks != 0 || done; });
++            if (queued_callbacks == 0)
++                break;
++            --queued_callbacks;
++        }
++        auto delivery = mailbox.take();
++        if (!delivery.frame.frame) {
++            monotonic = false;
++            continue;
++        }
++        const int id = static_cast<int>(delivery.frame.frame->pts);
++        monotonic = monotonic && id > last_id;
++        last_id = id;
++        accounted_frames += delivery.frames_lost + 1;
++        std::this_thread::yield();
++    }
++    producer.join();
++    CHECK(monotonic);
++    CHECK(last_id == count);
++    CHECK(accounted_frames == count);
++    CHECK(peak_callbacks == 1);
++    CHECK(released == count);
++}
++
++static void test_cancellation_race()
++{
++    const int count = 20000;
++    std::atomic<int> released{0};
++    VideoFrameMailbox mailbox;
++    std::atomic<bool> cancelled{false};
++    std::atomic<bool> done{false};
++    std::atomic<bool> valid{true};
++    std::mutex start_mutex;
++    std::condition_variable started;
++    bool producer_started = false;
++    std::thread producer([&]() {
++        for (int id = 1; id <= count; ++id) {
++            const bool after_cancel = cancelled.load();
++            const bool notify = mailbox.push(make_frame(released, id));
++            if (after_cancel && notify)
++                valid = false;
++            if (id == 1000) {
++                std::lock_guard<std::mutex> lock(start_mutex);
++                producer_started = true;
++                started.notify_one();
++            }
++        }
++        done = true;
++    });
++    std::thread consumer([&]() {
++        while (!done.load()) {
++            const bool after_cancel = cancelled.load();
++            auto delivery = mailbox.take();
++            if (after_cancel && delivery.frame.frame)
++                valid = false;
++            std::this_thread::yield();
++        }
++    });
++    {
++        std::unique_lock<std::mutex> lock(start_mutex);
++        started.wait(lock, [&]() { return producer_started; });
++    }
++    mailbox.cancel();
++    cancelled = true;
++    producer.join();
++    consumer.join();
++    CHECK(valid);
++    CHECK(!mailbox.take().frame.frame);
++    CHECK(released == count);
++}
++
++int main()
++{
++    try {
++        test_stalled_consumer_gets_newest();
++        test_loss_and_recovery_metadata();
++        test_cancel_and_session_replacement();
++        test_producer_consumer_race();
++        test_cancellation_race();
++        std::cout << "Video frame mailbox: 5 tests passed\n";
++        return 0;
++    } catch (const std::exception &e) {
++        std::cerr << "Video frame mailbox: " << e.what() << '\n';
++        return 1;
++    }
++}

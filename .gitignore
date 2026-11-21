@@ -1,0 +1,14 @@
+/artifacts/
+/build/
+*.apk
+*.app
+*.dmg
+*.p12
+*.jks
+*.keystore
+*.pem
+*.mobileprovision
+*.log
+*.trace
+__pycache__/
+.DS_Store
