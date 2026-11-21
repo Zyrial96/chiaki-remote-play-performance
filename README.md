@@ -25,6 +25,8 @@ The measurements are specific to test hardware and scenes. They cover texture pr
 
 ## Build and release
 
+Published [macOS previews](https://github.com/Zyrial96/chiaki-remote-play-performance/releases) include the app, source archives and checksums. The preview requires Apple Silicon and macOS 27.2 or later. It uses an ad-hoc signature and carries no Apple notarization ticket.
+
 - [Recreate the source and build either client](docs/BUILD.md)
 - [Supported hardware, signing and release status](docs/RELEASE.md)
 

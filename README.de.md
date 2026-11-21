@@ -25,6 +25,8 @@ Die Ergebnisse gelten für die getesteten Geräte und Szenen. Die [Messmethoden 
 
 ## Build und Freigabe
 
+Die [macOS-Vorschau auf GitHub](https://github.com/Zyrial96/chiaki-remote-play-performance/releases) enthält die App, Quellarchive und Prüfsummen. Sie erfordert Apple Silicon und macOS 27.2 oder neuer. Sie ist ad hoc signiert und wurde von Apple nicht notarisiert.
+
 - [Quellstand wiederherstellen und Clients bauen](docs/BUILD.de.md)
 - [Getestete Hardware, Signierung und Freigabestatus](docs/RELEASE.de.md)
 
