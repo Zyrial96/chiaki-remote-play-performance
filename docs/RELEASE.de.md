@@ -7,10 +7,12 @@ Die Pakete dieses Stands sind Release-Kandidaten. Die Mac-Vorschau ist für Appl
 | Paket | Geprüft | Vor allgemeiner Binärverteilung |
 | --- | --- | --- |
 | macOS Apple Silicon | Frischer Quellcode-Build und beide CTest-Suiten auf einem M4 bestanden. Die aus der Release-ZIP entpackte App importierte bei 1080p60 in 16 Sekunden 919 Bilder aus einem laufenden PS5-Stream. | Mit der Developer ID des Herausgebers signieren und von Apple notarisieren lassen. Das Notarisierungsticket an die App heften, Gatekeeper prüfen und das signierte Paket entpackt auf einem zweiten Mac mit der angegebenen Mindestversion testen. |
-| Android TV `armeabi-v7a` | Build, 60 Unit-Tests, APK-Ausrichtung und Live-Streaming im LAN mit dem entwicklungssignierten Gegenstück auf Sony und Xiaomi. Die DEX-Dateien und nativen Bibliotheken stimmen bytegenau mit dem getesteten APK überein. | Mit dem dauerhaften Release-Schlüssel des Herausgebers signieren, Signatur prüfen und eine Neuinstallation testen. |
-| Android TV `arm64-v8a` | Build, APK-Ausrichtung und 16-KiB-Ausrichtung der ARM64-ELF-Segmente geprüft. | Das signierte Paket auf einem physischen ARM64-Android-TV-Gerät testen, bevor die Gerätekompatibilität zugesichert wird. |
+| Android TV `armeabi-v7a` | Build, 60 Unit-Tests, APK-Ausrichtung und Live-Streaming im LAN mit dem entwicklungssignierten Gegenstück auf Sony und Xiaomi. Die DEX-Dateien und nativen Bibliotheken stimmen bytegenau mit dem getesteten APK überein. Die lokale Release-Signatur ist verifiziert. | Mit dem dauerhaften Release-Schlüssel des Herausgebers signieren, Signatur prüfen und eine Neuinstallation testen. |
+| Android TV `arm64-v8a` | Build, APK-Ausrichtung und 16-KiB-Ausrichtung der ARM64-ELF-Segmente geprüft. Das lokal signierte APK ließ sich auf einem ARM64-Emulator mit Android TV 14 neu installieren, starten und erneut darüber installieren. | Das signierte Paket auf einem physischen ARM64-Android-TV-Gerät testen, bevor die Gerätekompatibilität zugesichert wird. |
 
 Android prüft die Signatur beim Update. Ein Paket mit einem anderen Signaturschlüssel kann eine bereits installierte App mit derselben Paket-ID nicht ersetzen. Prüfe eine Neuinstallation auf einem separaten Gerät oder in einem separaten Profil, damit vorhandene Einstellungen erhalten bleiben. Lege vor der ersten signierten Veröffentlichung die öffentliche Paket-ID und die Versionsregeln fest.
+
+[Skripte und Anleitung zur Signierung](SIGNING.de.md)
 
 Signaturschlüssel, Entwicklerkennwörter und Registrierungsdaten gehören außerhalb des Repositorys. [Android-Dokumentation zur App-Signierung](https://developer.android.com/studio/publish/app-signing) · [Apple-Dokumentation zur Notarisierung](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
 

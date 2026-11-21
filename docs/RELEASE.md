@@ -7,10 +7,12 @@ Treat the packages associated with this snapshot as release candidates. The Mac 
 | Artifact | Validation | Before general binary distribution |
 | --- | --- | --- |
 | macOS Apple Silicon | Fresh source build and both CTest suites passed on an M4. The app extracted from the release ZIP imported 919 live frames in 16 seconds at 1080p60. | Use the publisher's Developer ID, notarize and staple the distributable app, verify Gatekeeper, and test the signed archived artifact on a second Mac at the declared minimum macOS version. |
-| Android TV `armeabi-v7a` | Build, 60 unit tests, APK alignment and live LAN playback with the development-signed equivalent on Sony and Xiaomi. The DEX files and native libraries are byte-identical to that tested APK. | Use the publisher's persistent release signing key, verify the signature and test a clean install. |
-| Android TV `arm64-v8a` | Build, APK alignment and 16 KiB ARM64 ELF segment alignment. | Test the signed artifact on a physical ARM64 Android TV device before claiming compatibility. |
+| Android TV `armeabi-v7a` | Build, 60 unit tests, APK alignment and live LAN playback with the development-signed equivalent on Sony and Xiaomi. The DEX files and native libraries are byte-identical to that tested APK. The local release signature has been verified. | Use the publisher's persistent release signing key, verify the signature and test a clean install. |
+| Android TV `arm64-v8a` | Build, APK alignment and 16 KiB ARM64 ELF segment alignment. The locally signed APK passed clean installation, launch and reinstallation on an Android TV 14 ARM64 emulator. | Test the signed artifact on a physical ARM64 Android TV device before claiming compatibility. |
 
 Android uses signing certificates to authorize updates. A package signed with a different key cannot replace an installed copy of the same package ID. Test the fresh-install route on a separate device or profile to preserve existing settings. Choose the public package ID and version policy before the first signed release.
+
+[Signing scripts and instructions](SIGNING.md)
 
 Use [Android app signing documentation](https://developer.android.com/studio/publish/app-signing) and [Apple's notarization instructions](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution). Keep signing identities, developer passwords and registration material outside the repository.
 
